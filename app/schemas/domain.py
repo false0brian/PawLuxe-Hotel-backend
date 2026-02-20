@@ -155,6 +155,26 @@ class StreamTokenRequest(BaseModel):
 class StreamVerifyRequest(BaseModel):
     token: str
     cam_id: str | None = None
+    viewer_session_id: str | None = None
+
+
+class LiveTrackIngestDetection(BaseModel):
+    source_track_id: str | int
+    bbox_xyxy: list[float]
+    conf: float = 0.0
+    class_id: int | None = None
+    animal_id: str | None = None
+    global_track_id: str | None = None
+
+
+class LiveTrackIngestRequest(BaseModel):
+    camera_id: str
+    ts: datetime | None = None
+    detections: list[LiveTrackIngestDetection]
+
+
+class StaffAlertAckRequest(BaseModel):
+    status: str = "acked"  # acked | resolved
 
 
 class UserCreate(BaseModel):

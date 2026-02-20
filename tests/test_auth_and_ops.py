@@ -432,3 +432,125 @@ def test_live_zone_heatmap_endpoint() -> None:
     assert zones
     assert len(zones[0]["counts"]) == body["bucket_count"]
     assert zones[0]["total_observations"] >= 4
+
+
+def test_stream_verify_enforces_session_limit() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+
+    pet_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "dog", "name": f"Buddy-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert pet_resp.status_code == 200
+    pet_id = pet_resp.json()["animal_id"]
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": f"S1-ROOM-{suffix}"},
+        headers=_headers("admin", "admin-1"),
+    )
+    cam_id = cam_resp.json()["camera_id"]
+    booking_resp = client.post(
+        "/api/v1/bookings",
+        json={
+            "owner_id": owner_id,
+            "pet_id": pet_id,
+            "start_at": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+            "end_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            "room_zone_id": f"S1-ROOM-{suffix}",
+            "status": "checked_in",
+        },
+        headers=_headers("admin", "admin-1"),
+    )
+    booking_id = booking_resp.json()["booking_id"]
+    token_resp = client.post(
+        "/api/v1/auth/stream-token",
+        json={"owner_id": owner_id, "booking_id": booking_id, "pet_id": pet_id, "max_sessions": 1},
+        headers=_headers("owner", owner_id),
+    )
+    assert token_resp.status_code == 200
+    token = token_resp.json()["token"]
+
+    v1 = client.post(
+        "/api/v1/auth/stream-verify",
+        json={"token": token, "cam_id": cam_id, "viewer_session_id": "device-a"},
+        headers=_headers("system"),
+    )
+    assert v1.status_code == 200
+    assert v1.json()["active_sessions"] == 1
+
+    v2 = client.post(
+        "/api/v1/auth/stream-verify",
+        json={"token": token, "cam_id": cam_id, "viewer_session_id": "device-b"},
+        headers=_headers("system"),
+    )
+    assert v2.status_code == 403
+
+
+def test_system_ingest_and_alert_evaluate_flow() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+    pet_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "cat", "name": f"Nabi-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert pet_resp.status_code == 200
+    pet_id = pet_resp.json()["animal_id"]
+
+    zone_id = f"S1-ROOM-{suffix}"
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": zone_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert cam_resp.status_code == 200
+    cam_id = cam_resp.json()["camera_id"]
+
+    ingest_resp = client.post(
+        "/api/v1/system/live-tracks/ingest",
+        json={
+            "camera_id": cam_id,
+            "detections": [
+                {
+                    "source_track_id": 7,
+                    "bbox_xyxy": [12.0, 20.0, 80.0, 120.0],
+                    "conf": 0.88,
+                    "animal_id": pet_id,
+                }
+            ],
+        },
+        headers=_headers("system"),
+    )
+    assert ingest_resp.status_code == 200
+    assert ingest_resp.json()["created_observations"] >= 1
+
+    booking_resp = client.post(
+        "/api/v1/bookings",
+        json={
+            "owner_id": owner_id,
+            "pet_id": pet_id,
+            "start_at": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+            "end_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+            "room_zone_id": zone_id,
+            "status": "checked_in",
+        },
+        headers=_headers("admin", "admin-1"),
+    )
+    assert booking_resp.status_code == 200
+
+    health_resp = client.post(
+        "/api/v1/system/camera-health",
+        json={"camera_id": cam_id, "status": "down", "reconnect_count": 3},
+        headers=_headers("system"),
+    )
+    assert health_resp.status_code == 200
+
+    eval_resp = client.post("/api/v1/system/alerts/evaluate", headers=_headers("system"))
+    assert eval_resp.status_code == 200
+
+    alerts_resp = client.get("/api/v1/staff/alerts?status=open", headers=_headers("staff", "staff-1"))
+    assert alerts_resp.status_code == 200
+    alerts = alerts_resp.json()
+    assert any(row["camera_id"] == cam_id for row in alerts)

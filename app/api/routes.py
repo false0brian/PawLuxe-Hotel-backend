@@ -34,7 +34,10 @@ from app.db.models import (
     MediaSegment,
     PetZoneEvent,
     Position,
+    RealtimeTrackBinding,
+    StaffAlert,
     StreamAuditLog,
+    StreamPlaybackSession,
     Track,
     TrackObservation,
     User,
@@ -55,10 +58,12 @@ from app.schemas.domain import (
     ExportRequest,
     HighlightRequest,
     IdentityUpsert,
+    LiveTrackIngestRequest,
     MediaSegmentCreate,
     PetZoneMoveCreate,
     PositionCreate,
     SessionCreateRequest,
+    StaffAlertAckRequest,
     StreamTokenRequest,
     StreamVerifyRequest,
     TrackCreate,
@@ -208,6 +213,50 @@ def _audit_stream(
     )
     session.add(row)
     session.commit()
+
+
+def _ensure_staff_alert(
+    session: Session,
+    *,
+    type: str,
+    severity: str,
+    message: str,
+    zone_id: str | None = None,
+    camera_id: str | None = None,
+    pet_id: str | None = None,
+    booking_id: str | None = None,
+    details: dict[str, Any] | None = None,
+    dedupe_seconds: int = 120,
+) -> StaffAlert:
+    since = utcnow() - timedelta(seconds=max(1, dedupe_seconds))
+    existing = session.exec(
+        select(StaffAlert)
+        .where(StaffAlert.type == type)
+        .where(StaffAlert.status == "open")
+        .where(StaffAlert.at >= since)
+        .where(StaffAlert.camera_id == camera_id)
+        .where(StaffAlert.pet_id == pet_id)
+        .where(StaffAlert.booking_id == booking_id)
+        .order_by(StaffAlert.at.desc())
+        .limit(1)
+    ).first()
+    if existing:
+        return existing
+
+    row = StaffAlert(
+        type=type,
+        severity=severity,
+        message=message,
+        zone_id=zone_id,
+        camera_id=camera_id,
+        pet_id=pet_id,
+        booking_id=booking_id,
+        details_json=json.dumps(details, ensure_ascii=True) if details else None,
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
 
 
 def _parse_bbox_xyxy(raw: str) -> list[float] | None:
@@ -882,6 +931,255 @@ async def ws_live_tracks(websocket: WebSocket) -> None:
         return
 
 
+@router.post("/system/live-tracks/ingest")
+def ingest_live_tracks(
+    payload: LiveTrackIngestRequest,
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    camera = session.get(Camera, payload.camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    ts = payload.ts or utcnow()
+
+    created_tracks = 0
+    created_observations = 0
+    created_associations = 0
+
+    for det in payload.detections:
+        if len(det.bbox_xyxy) != 4:
+            continue
+        source_track_id = str(det.source_track_id)
+        binding = session.exec(
+            select(RealtimeTrackBinding)
+            .where(RealtimeTrackBinding.camera_id == payload.camera_id)
+            .where(RealtimeTrackBinding.source_track_id == source_track_id)
+            .order_by(RealtimeTrackBinding.last_seen_at.desc())
+            .limit(1)
+        ).first()
+        if binding:
+            track = session.get(Track, binding.track_id)
+            if track is None:
+                binding = None
+        if not binding:
+            track = Track(
+                camera_id=payload.camera_id,
+                start_ts=ts,
+                end_ts=ts,
+                quality_score=float(det.conf),
+            )
+            session.add(track)
+            session.flush()
+            binding = RealtimeTrackBinding(
+                camera_id=payload.camera_id,
+                source_track_id=source_track_id,
+                track_id=track.track_id,
+                last_seen_at=ts,
+            )
+            session.add(binding)
+            created_tracks += 1
+        else:
+            track = session.get(Track, binding.track_id)
+            if not track:
+                continue
+            prev_q = float(track.quality_score or 0.0)
+            track.quality_score = round((prev_q + float(det.conf)) / 2.0, 6)
+            track.end_ts = ts
+            binding.last_seen_at = ts
+            session.add(binding)
+
+        obs = TrackObservation(
+            track_id=track.track_id,
+            ts=ts,
+            bbox=json.dumps([round(float(v), 3) for v in det.bbox_xyxy], ensure_ascii=True),
+            marker_id_read=None,
+            appearance_vec_ref=(
+                f"ingest;source:{source_track_id};class:{det.class_id if det.class_id is not None else -1};conf:{det.conf:.6f}"
+            ),
+        )
+        session.add(obs)
+        created_observations += 1
+
+        if det.animal_id:
+            if not session.get(Animal, det.animal_id):
+                continue
+            assoc = session.exec(
+                select(Association)
+                .where(Association.track_id == track.track_id)
+                .where(Association.animal_id == det.animal_id)
+                .order_by(Association.created_at.desc())
+                .limit(1)
+            ).first()
+            if assoc is None:
+                assoc = Association(
+                    global_track_id=det.global_track_id or f"animal:{det.animal_id}",
+                    track_id=track.track_id,
+                    animal_id=det.animal_id,
+                    confidence=float(det.conf),
+                    created_at=ts,
+                )
+                session.add(assoc)
+                created_associations += 1
+
+    # best-effort camera health heartbeat for ingest path
+    health = session.get(CameraHealth, payload.camera_id) or CameraHealth(camera_id=payload.camera_id)
+    health.status = "healthy"
+    health.last_frame_at = ts
+    health.updated_at = utcnow()
+    session.add(health)
+    session.commit()
+    return {
+        "ok": True,
+        "camera_id": payload.camera_id,
+        "created_tracks": created_tracks,
+        "created_observations": created_observations,
+        "created_associations": created_associations,
+    }
+
+
+@router.post("/system/alerts/evaluate")
+def evaluate_staff_alerts(
+    stale_seconds: int = Query(default=15, ge=5, le=600),
+    isolation_minutes: int = Query(default=15, ge=1, le=180),
+    idle_seconds: int = Query(default=180, ge=30, le=3600),
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    created = 0
+
+    # Rule 1: camera health degraded/down/stale
+    health_rows = list(session.exec(select(CameraHealth)))
+    for row in health_rows:
+        is_stale = True
+        if row.last_frame_at:
+            is_stale = (now - _to_utc(row.last_frame_at)).total_seconds() > stale_seconds
+        if row.status in {"down", "degraded"} or is_stale:
+            sev = "critical" if row.status == "down" else "warning"
+            detail = {"status": row.status, "is_stale": is_stale, "last_frame_at": row.last_frame_at}
+            _ensure_staff_alert(
+                session,
+                type="camera_health",
+                severity=sev,
+                message=f"카메라 상태 이상: {row.camera_id} ({row.status}{', stale' if is_stale else ''})",
+                camera_id=row.camera_id,
+                details=detail,
+                dedupe_seconds=120,
+            )
+            created += 1
+
+    # Rule 2: recent move to isolation
+    isolation_since = now - timedelta(minutes=isolation_minutes)
+    iso_rows = list(
+        session.exec(
+            select(PetZoneEvent)
+            .where(PetZoneEvent.at >= isolation_since)
+            .where(PetZoneEvent.to_zone_id.contains("ISOLATION"))
+            .order_by(PetZoneEvent.at.desc())
+            .limit(100)
+        )
+    )
+    for row in iso_rows:
+        _ensure_staff_alert(
+            session,
+            type="isolation_move",
+            severity="warning",
+            message=f"격리 이동 감지: pet={row.pet_id}, zone={row.to_zone_id}",
+            zone_id=row.to_zone_id,
+            pet_id=row.pet_id,
+            details={"from_zone_id": row.from_zone_id, "by_staff_id": row.by_staff_id, "at": row.at.isoformat()},
+            dedupe_seconds=300,
+        )
+        created += 1
+
+    # Rule 3: active booking pet has no recent track observation
+    bookings = list(
+        session.exec(
+            select(Booking)
+            .where(Booking.status.in_(["reserved", "checked_in"]))
+            .where(Booking.start_at <= now)
+            .where(Booking.end_at >= now)
+            .limit(500)
+        )
+    )
+    for booking in bookings:
+        assoc_rows = list(
+            session.exec(
+                select(Association)
+                .where(Association.animal_id == booking.pet_id)
+                .order_by(Association.created_at.desc())
+                .limit(20)
+            )
+        )
+        latest_obs_ts: datetime | None = None
+        for assoc in assoc_rows:
+            obs = session.exec(
+                select(TrackObservation)
+                .where(TrackObservation.track_id == assoc.track_id)
+                .order_by(TrackObservation.ts.desc())
+                .limit(1)
+            ).first()
+            if obs and (latest_obs_ts is None or obs.ts > latest_obs_ts):
+                latest_obs_ts = obs.ts
+
+        if latest_obs_ts is None or (now - _to_utc(latest_obs_ts)).total_seconds() > idle_seconds:
+            latest_zone = session.exec(
+                select(PetZoneEvent).where(PetZoneEvent.pet_id == booking.pet_id).order_by(PetZoneEvent.at.desc()).limit(1)
+            ).first()
+            zone_id = latest_zone.to_zone_id if latest_zone else booking.room_zone_id
+            _ensure_staff_alert(
+                session,
+                type="animal_idle",
+                severity="warning",
+                message=f"트래킹 공백 감지: pet={booking.pet_id}, zone={zone_id}",
+                zone_id=zone_id,
+                pet_id=booking.pet_id,
+                booking_id=booking.booking_id,
+                details={"last_observation_ts": latest_obs_ts.isoformat() if latest_obs_ts else None},
+                dedupe_seconds=180,
+            )
+            created += 1
+
+    return {"ok": True, "created_or_touched": created}
+
+
+@router.get("/staff/alerts")
+def list_staff_alerts(
+    status: str | None = Query(default="open"),
+    limit: int = Query(default=100, ge=1, le=500),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> list[StaffAlert]:
+    query = select(StaffAlert)
+    if status:
+        query = query.where(StaffAlert.status == status)
+    query = query.order_by(StaffAlert.updated_at.desc()).limit(limit)
+    return list(session.exec(query))
+
+
+@router.post("/staff/alerts/{alert_id}/ack")
+def ack_staff_alert(
+    alert_id: str,
+    payload: StaffAlertAckRequest,
+    auth: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> StaffAlert:
+    row = session.get(StaffAlert, alert_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    status = payload.status.strip().lower()
+    if status not in {"acked", "resolved"}:
+        raise HTTPException(status_code=400, detail="status must be acked or resolved")
+    row.status = status
+    row.acked_by = auth.user_id or row.acked_by
+    row.acked_at = utcnow()
+    row.updated_at = utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
 @router.get("/owner/dashboard")
 def get_owner_dashboard(
     owner_id: str = Query(...),
@@ -1123,6 +1421,7 @@ def create_stream_token(
         "exp": exp,
         "zone_id": current_zone,
         "cam_ids": cam_ids,
+        "watermark": claims["watermark"],
         "stream_urls": stream_urls,
     }
 
@@ -1190,6 +1489,65 @@ def verify_stream_token(
         )
         raise HTTPException(status_code=403, detail="No valid persisted access token found")
 
+    # Enforce concurrent playback session limits with soft heartbeat semantics.
+    viewer_session_id = (payload.viewer_session_id or "").strip() or f"legacy:{cam_for_check}"
+    max_sessions = max(1, int(claims.get("max_sessions", row.sessions or 1)))
+    heartbeat_window = utcnow() - timedelta(seconds=90)
+    token_fingerprint = hash_session_token(payload.token)
+
+    active_rows = list(
+        session.exec(
+            select(StreamPlaybackSession)
+            .where(StreamPlaybackSession.token_fingerprint == token_fingerprint)
+            .where(StreamPlaybackSession.active.is_(True))
+            .where(StreamPlaybackSession.last_seen_at >= heartbeat_window)
+            .order_by(StreamPlaybackSession.last_seen_at.desc())
+            .limit(20)
+        )
+    )
+    active_session_ids = {it.viewer_session_id for it in active_rows}
+    now = utcnow()
+    if viewer_session_id not in active_session_ids and len(active_session_ids) >= max_sessions:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            owner_id=str(claims.get("sub", "")),
+            booking_id=str(claims.get("booking_id", "")),
+            pet_id=str(claims.get("pet_id", "")),
+            zone_id=str(claims.get("zone_id", "")),
+            cam_id=cam_for_check,
+            result="denied",
+            reason=f"session_limit_exceeded:{len(active_session_ids)}/{max_sessions}",
+        )
+        raise HTTPException(status_code=403, detail="Session limit exceeded")
+
+    playback_row = session.exec(
+        select(StreamPlaybackSession)
+        .where(StreamPlaybackSession.token_fingerprint == token_fingerprint)
+        .where(StreamPlaybackSession.viewer_session_id == viewer_session_id)
+        .where(StreamPlaybackSession.cam_id == cam_for_check)
+        .order_by(StreamPlaybackSession.last_seen_at.desc())
+        .limit(1)
+    ).first()
+    if playback_row is None:
+        playback_row = StreamPlaybackSession(
+            token_fingerprint=token_fingerprint,
+            owner_id=str(claims.get("sub", "")),
+            booking_id=str(claims.get("booking_id", "")),
+            pet_id=str(claims.get("pet_id", "")),
+            cam_id=cam_for_check,
+            viewer_session_id=viewer_session_id,
+            active=True,
+            created_at=now,
+            last_seen_at=now,
+        )
+    else:
+        playback_row.last_seen_at = now
+        playback_row.active = True
+    session.add(playback_row)
+    session.commit()
+
     _audit_stream(
         session,
         action="verify",
@@ -1205,7 +1563,10 @@ def verify_stream_token(
     return {
         "ok": True,
         "cam_id": cam_for_check,
-        "max_sessions": int(claims.get("max_sessions", 1)),
+        "max_sessions": max_sessions,
+        "active_sessions": len(active_session_ids | {viewer_session_id}),
+        "viewer_session_id": viewer_session_id,
+        "watermark": str(claims.get("watermark", "")),
         "exp": int(claims.get("exp", 0)),
     }
 
@@ -1214,11 +1575,12 @@ def verify_stream_token(
 def verify_stream_hook(
     token: str = Query(...),
     cam_id: str = Query(...),
+    viewer_session_id: str | None = Query(default=None),
     auth: AuthContext = Depends(require_admin_or_system),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     return verify_stream_token(
-        payload=StreamVerifyRequest(token=token, cam_id=cam_id),
+        payload=StreamVerifyRequest(token=token, cam_id=cam_id, viewer_session_id=viewer_session_id),
         auth=auth,
         session=session,
     )

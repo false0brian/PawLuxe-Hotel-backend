@@ -10,7 +10,17 @@ import numpy as np
 from sqlmodel import Session, select
 
 from app.core.config import settings
-from app.db.models import Animal, Association, Camera, GlobalIdentity, GlobalTrackProfile, Track, TrackObservation, utcnow
+from app.db.models import (
+    Animal,
+    Association,
+    Camera,
+    CameraHealth,
+    GlobalIdentity,
+    GlobalTrackProfile,
+    Track,
+    TrackObservation,
+    utcnow,
+)
 from app.db.models import MediaSegment
 from app.db.session import engine
 from app.services.tracking_service import YoloDeepSortTracker
@@ -216,6 +226,28 @@ def _open_capture_with_retry(stream_url: str, retries: int, retry_delay_seconds:
     raise RuntimeError(last_error or "Failed to open stream")
 
 
+def _upsert_health(
+    session: Session,
+    *,
+    camera_id: str,
+    status: str,
+    fps: float | None = None,
+    reconnect_count: int | None = None,
+    message: str | None = None,
+) -> None:
+    row = session.get(CameraHealth, camera_id)
+    if row is None:
+        row = CameraHealth(camera_id=camera_id)
+    row.status = status
+    row.fps = fps
+    if reconnect_count is not None:
+        row.reconnect_count = reconnect_count
+    row.last_frame_at = utcnow()
+    row.updated_at = utcnow()
+    row.message = message
+    session.add(row)
+
+
 def run(args: argparse.Namespace) -> None:
     classes = _parse_classes(args.classes_csv)
     started_at = utcnow()
@@ -260,16 +292,25 @@ def run(args: argparse.Namespace) -> None:
         total_tracks_written = 0
         total_observations_written = 0
         active_tracks: dict[int, ActiveTrack] = {}
+        reconnect_count = 0
 
         try:
             while True:
                 ok, frame = cap.read()
                 if not ok:
+                    reconnect_count += 1
                     cap.release()
                     cap = _open_capture_with_retry(
                         stream_url,
                         args.reconnect_retries,
                         args.reconnect_delay_seconds,
+                    )
+                    _upsert_health(
+                        session,
+                        camera_id=args.camera_id,
+                        status="degraded",
+                        reconnect_count=reconnect_count,
+                        message="stream reconnect",
                     )
                     continue
 
@@ -411,6 +452,15 @@ def run(args: argparse.Namespace) -> None:
                 processed_frames += 1
 
                 if processed_frames % max(args.commit_interval_frames, 1) == 0:
+                    elapsed = max((utcnow() - started_at).total_seconds(), 1.0)
+                    measured_fps = float(processed_frames) / elapsed
+                    _upsert_health(
+                        session,
+                        camera_id=args.camera_id,
+                        status="healthy",
+                        fps=round(measured_fps, 3),
+                        reconnect_count=reconnect_count,
+                    )
                     session.commit()
 
                 if args.max_frames > 0 and processed_frames >= args.max_frames:
@@ -435,6 +485,16 @@ def run(args: argparse.Namespace) -> None:
                             codec="video/mp4",
                         )
                     )
+            elapsed = max((utcnow() - started_at).total_seconds(), 1.0)
+            measured_fps = float(processed_frames) / elapsed if processed_frames > 0 else None
+            _upsert_health(
+                session,
+                camera_id=args.camera_id,
+                status="healthy" if processed_frames > 0 else "down",
+                fps=round(measured_fps, 3) if measured_fps is not None else None,
+                reconnect_count=reconnect_count,
+                message="worker stopped",
+            )
             session.commit()
             cap.release()
 

@@ -10,6 +10,8 @@ FastAPI 기반 반려동물 호텔 운영 백엔드입니다.
 - 카메라 헬스 모니터링/감사로그
 - RTSP 트래킹 워커 및 Export 파이프라인
 - 라이브 트랙 조회/스트리밍 (객체 bbox 오버레이용)
+- 시스템 ingest/알림 파이프라인
+- 스트림 동시 세션 제한 검증
 
 ## 로컬 실행
 ```bash
@@ -61,6 +63,16 @@ API_KEY=change-me \
 - `GET /api/v1/live/zones/heatmap`: 존 단위 시간 버킷 히트맵 집계
 - `WS /api/v1/ws/live-tracks`: 실시간 트랙 스트림
 - `GET /api/v1/live/cameras/{camera_id}/playback-url`: 프론트 오버레이용 재생 URL 조회
+- `POST /api/v1/system/live-tracks/ingest`: 외부 추적기 입력을 실시간 적재
+
+## 운영 알림 API
+- `POST /api/v1/system/alerts/evaluate`: 카메라/격리이동/트래킹공백 규칙 평가
+- `GET /api/v1/staff/alerts`: 스태프 알림 목록 조회
+- `POST /api/v1/staff/alerts/{alert_id}/ack`: 알림 ack/resolved 처리
+
+## 스트림 보안
+- `POST /api/v1/auth/stream-verify`는 `viewer_session_id` 기반 동시 세션 제한을 강제합니다.
+- 토큰 응답에 `watermark` 문자열이 포함됩니다.
 
 ## Docker 스택
 ```bash

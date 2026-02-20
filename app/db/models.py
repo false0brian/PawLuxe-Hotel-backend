@@ -203,6 +203,32 @@ class AccessToken(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow, index=True)
 
 
+class StreamPlaybackSession(SQLModel, table=True):
+    __tablename__ = "stream_playback_sessions"
+
+    playback_id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    token_fingerprint: str = Field(index=True)
+    owner_id: str = Field(index=True)
+    booking_id: str = Field(index=True)
+    pet_id: str = Field(index=True)
+    cam_id: str = Field(index=True)
+    viewer_session_id: str = Field(index=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    last_seen_at: datetime = Field(default_factory=utcnow, index=True)
+    active: bool = Field(default=True, index=True)
+
+
+class RealtimeTrackBinding(SQLModel, table=True):
+    __tablename__ = "realtime_track_bindings"
+
+    binding_id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    camera_id: str = Field(foreign_key="cameras.camera_id", index=True)
+    source_track_id: str = Field(index=True)
+    track_id: str = Field(foreign_key="tracks.track_id", index=True)
+    last_seen_at: datetime = Field(default_factory=utcnow, index=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+
+
 class CareLog(SQLModel, table=True):
     __tablename__ = "care_logs"
 
@@ -231,6 +257,25 @@ class StreamAuditLog(SQLModel, table=True):
     cam_id: str | None = Field(default=None, index=True)
     result: str = Field(default="ok", index=True)  # ok | denied
     reason: str | None = None
+
+
+class StaffAlert(SQLModel, table=True):
+    __tablename__ = "staff_alerts"
+
+    alert_id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    at: datetime = Field(default_factory=utcnow, index=True)
+    type: str = Field(index=True)
+    severity: str = Field(default="warning", index=True)  # info | warning | critical
+    status: str = Field(default="open", index=True)  # open | acked | resolved
+    message: str
+    zone_id: str | None = Field(default=None, index=True)
+    camera_id: str | None = Field(default=None, index=True)
+    pet_id: str | None = Field(default=None, index=True)
+    booking_id: str | None = Field(default=None, index=True)
+    details_json: str | None = None
+    acked_by: str | None = Field(default=None, index=True)
+    acked_at: datetime | None = Field(default=None, index=True)
+    updated_at: datetime = Field(default_factory=utcnow, index=True)
 
 
 class CameraHealth(SQLModel, table=True):
