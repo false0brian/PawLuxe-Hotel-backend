@@ -1,9 +1,10 @@
 import json
+import asyncio
 from datetime import datetime, timedelta, timezone
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
@@ -40,7 +41,7 @@ from app.db.models import (
     VideoAnalysis,
     utcnow,
 )
-from app.db.session import get_session
+from app.db.session import engine, get_session
 from app.schemas.domain import (
     AnimalCreate,
     AssociationCreate,
@@ -142,6 +143,44 @@ def _is_play_zone(zone_id: str) -> bool:
     return len(parts) >= 2 and parts[1] == "PLAY"
 
 
+def _next_action_for_staff(booking: Booking, latest_log: CareLog | None, now: datetime) -> str:
+    end_at = _to_utc(booking.end_at)
+    remaining_min = (end_at - now).total_seconds() / 60.0
+    if remaining_min <= 30:
+        return "checkout_prepare"
+    if latest_log is None:
+        return "feeding_due"
+    if latest_log.type == "feeding":
+        return "potty_check"
+    if latest_log.type == "potty":
+        return "walk_due"
+    if latest_log.type == "walk":
+        return "rest_monitor"
+    if latest_log.type == "medication":
+        return "medication_followup"
+    return "care_check"
+
+
+def _serialize_care_log(row: CareLog) -> dict[str, Any]:
+    details: dict[str, Any] | None = None
+    if row.value_json:
+        try:
+            parsed = json.loads(row.value_json)
+            details = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            details = None
+    return {
+        "log_id": row.log_id,
+        "pet_id": row.pet_id,
+        "booking_id": row.booking_id,
+        "type": row.type,
+        "at": row.at,
+        "value": row.value,
+        "details": details,
+        "staff_id": row.staff_id,
+    }
+
+
 def _audit_stream(
     session: Session,
     *,
@@ -169,6 +208,64 @@ def _audit_stream(
     )
     session.add(row)
     session.commit()
+
+
+def _parse_bbox_xyxy(raw: str) -> list[float] | None:
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or len(parsed) != 4:
+            return None
+        vals = [float(v) for v in parsed]
+        return vals
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _collect_live_tracks(
+    session: Session,
+    *,
+    camera_id: str | None,
+    animal_id: str | None,
+    since_ts: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    query = (
+        select(TrackObservation, Track)
+        .join(Track, TrackObservation.track_id == Track.track_id)
+        .order_by(TrackObservation.ts.desc())
+        .limit(limit)
+    )
+    if camera_id:
+        query = query.where(Track.camera_id == camera_id)
+    if since_ts:
+        query = query.where(TrackObservation.ts >= since_ts)
+
+    rows = list(session.exec(query))
+    out: list[dict[str, Any]] = []
+    for obs, track in rows:
+        assoc = session.exec(
+            select(Association).where(Association.track_id == track.track_id).order_by(Association.created_at.desc()).limit(1)
+        ).first()
+        assoc_animal_id = assoc.animal_id if assoc else None
+        if animal_id and assoc_animal_id != animal_id:
+            continue
+
+        bbox = _parse_bbox_xyxy(obs.bbox)
+        if bbox is None:
+            continue
+        cam = session.get(Camera, track.camera_id)
+        out.append(
+            {
+                "ts": obs.ts,
+                "track_id": track.track_id,
+                "camera_id": track.camera_id,
+                "zone_id": cam.location_zone if cam else None,
+                "animal_id": assoc_animal_id,
+                "bbox_xyxy": bbox,
+                "quality_score": track.quality_score,
+            }
+        )
+    return out
 
 
 @router.post("/animals")
@@ -392,6 +489,84 @@ def staff_move_zone(
     return row
 
 
+@router.get("/staff/today-board")
+def get_staff_today_board(
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    bookings = list(
+        session.exec(
+            select(Booking)
+            .where(Booking.status.in_(["reserved", "checked_in"]))
+            .where(Booking.start_at <= now)
+            .where(Booking.end_at >= now)
+            .order_by(Booking.start_at.asc())
+        )
+    )
+
+    items: list[dict[str, Any]] = []
+    zone_counts: dict[str, int] = {}
+    action_counts = {
+        "feeding": 0,
+        "potty": 0,
+        "walk": 0,
+        "medication": 0,
+        "note": 0,
+    }
+    for booking in bookings:
+        pet = session.get(Animal, booking.pet_id)
+        if not pet:
+            continue
+        latest_zone = session.exec(
+            select(PetZoneEvent).where(PetZoneEvent.pet_id == pet.animal_id).order_by(PetZoneEvent.at.desc()).limit(1)
+        ).first()
+        current_zone = latest_zone.to_zone_id if latest_zone else booking.room_zone_id
+
+        latest_log = session.exec(
+            select(CareLog)
+            .where(CareLog.pet_id == pet.animal_id)
+            .where(CareLog.booking_id == booking.booking_id)
+            .order_by(CareLog.at.desc())
+            .limit(1)
+        ).first()
+
+        risk_badges: list[str] = []
+        if current_zone.upper().find("ISOLATION") >= 0:
+            risk_badges.append("격리")
+        if latest_log and latest_log.type == "medication":
+            risk_badges.append("투약")
+        if pet.species.lower() == "cat":
+            risk_badges.append("민감")
+        if not risk_badges:
+            risk_badges.append("정상")
+
+        if latest_log and latest_log.type in action_counts:
+            action_counts[latest_log.type] += 1
+        zone_counts[current_zone] = zone_counts.get(current_zone, 0) + 1
+
+        items.append(
+            {
+                "booking_id": booking.booking_id,
+                "pet_id": pet.animal_id,
+                "pet_name": pet.name,
+                "species": pet.species,
+                "current_zone": current_zone,
+                "risk_badges": risk_badges,
+                "last_log": latest_log,
+                "next_action": _next_action_for_staff(booking, latest_log, now),
+            }
+        )
+
+    return {
+        "at": now,
+        "total_active_bookings": len(items),
+        "zone_counts": zone_counts,
+        "action_counts": action_counts,
+        "items": items,
+    }
+
+
 @router.post("/staff/logs")
 def create_care_log(
     payload: CareLogCreate,
@@ -489,6 +664,245 @@ def get_pet_status(
         "last_zone_event_at": latest_zone.at if latest_zone else None,
         "last_care_log": next_log,
         "last_care_log_details": last_care_log_details,
+    }
+
+
+@router.get("/live/tracks/latest")
+def get_live_tracks_latest(
+    camera_id: str | None = Query(default=None),
+    animal_id: str | None = Query(default=None),
+    since_ts: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=300),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    items = _collect_live_tracks(
+        session=session,
+        camera_id=camera_id,
+        animal_id=animal_id,
+        since_ts=since_ts,
+        limit=limit,
+    )
+    next_cursor = max((row["ts"] for row in items), default=since_ts)
+    return {
+        "count": len(items),
+        "next_since_ts": next_cursor,
+        "tracks": items,
+    }
+
+
+@router.get("/live/cameras/{camera_id}/playback-url")
+def get_camera_playback_url(
+    camera_id: str,
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    camera = session.get(Camera, camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return {
+        "camera_id": camera_id,
+        "zone_id": camera.location_zone,
+        "stream_base_url": settings.stream_base_url,
+        "playback_url": f"{settings.stream_base_url}/{camera_id}",
+    }
+
+
+@router.websocket("/ws/live-tracks")
+async def ws_live_tracks(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        api_key = websocket.query_params.get("api_key", "")
+        role = (websocket.query_params.get("role", "staff") or "staff").lower()
+        user_id = websocket.query_params.get("user_id", "")
+        if api_key != settings.api_key:
+            await websocket.send_json({"error": "invalid_api_key"})
+            await websocket.close(code=1008)
+            return
+        if role not in {"staff", "admin", "system"}:
+            await websocket.send_json({"error": "role_must_be_staff_admin_system"})
+            await websocket.close(code=1008)
+            return
+        if role != "system" and not user_id.strip():
+            await websocket.send_json({"error": "user_id_required"})
+            await websocket.close(code=1008)
+            return
+
+        camera_id = websocket.query_params.get("camera_id")
+        animal_id = websocket.query_params.get("animal_id")
+        interval_ms_raw = websocket.query_params.get("interval_ms", "1000")
+        try:
+            interval_ms = max(200, min(5000, int(interval_ms_raw)))
+        except ValueError:
+            interval_ms = 1000
+        cursor = utcnow() - timedelta(seconds=5)
+
+        while True:
+            with Session(engine) as session:
+                rows = _collect_live_tracks(
+                    session=session,
+                    camera_id=camera_id,
+                    animal_id=animal_id,
+                    since_ts=cursor,
+                    limit=100,
+                )
+            if rows:
+                cursor = max(row["ts"] for row in rows)
+                await websocket.send_json(
+                    {
+                        "type": "tracks",
+                        "count": len(rows),
+                        "tracks": rows,
+                    }
+                )
+            await asyncio.sleep(interval_ms / 1000.0)
+    except WebSocketDisconnect:
+        return
+
+
+@router.get("/owner/dashboard")
+def get_owner_dashboard(
+    owner_id: str = Query(...),
+    auth: AuthContext = Depends(require_owner_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if auth.role == "owner" and auth.user_id != owner_id:
+        raise HTTPException(status_code=403, detail="owner_id must match x-user-id")
+
+    now = utcnow()
+    bookings = list(
+        session.exec(
+            select(Booking)
+            .where(Booking.owner_id == owner_id)
+            .where(Booking.start_at <= now)
+            .where(Booking.end_at >= now)
+            .where(Booking.status.in_(["reserved", "checked_in"]))
+            .order_by(Booking.start_at.asc())
+        )
+    )
+
+    cards: list[dict[str, Any]] = []
+    for booking in bookings:
+        pet = session.get(Animal, booking.pet_id)
+        if not pet:
+            continue
+        latest_zone = session.exec(
+            select(PetZoneEvent).where(PetZoneEvent.pet_id == pet.animal_id).order_by(PetZoneEvent.at.desc()).limit(1)
+        ).first()
+        zone_id = latest_zone.to_zone_id if latest_zone else booking.room_zone_id
+        cam_ids = _allowed_cam_ids(session, zone_id)
+
+        latest_log = session.exec(
+            select(CareLog)
+            .where(CareLog.pet_id == pet.animal_id)
+            .where(CareLog.booking_id == booking.booking_id)
+            .order_by(CareLog.at.desc())
+            .limit(1)
+        ).first()
+
+        cards.append(
+            {
+                "booking_id": booking.booking_id,
+                "pet_id": pet.animal_id,
+                "pet_name": pet.name,
+                "species": pet.species,
+                "current_zone_id": zone_id,
+                "cam_ids": cam_ids,
+                "last_care_log": _serialize_care_log(latest_log) if latest_log else None,
+                "status": booking.status,
+            }
+        )
+
+    return {
+        "owner_id": owner_id,
+        "at": now,
+        "active_booking_count": len(cards),
+        "cards": cards,
+    }
+
+
+@router.get("/reports/bookings/{booking_id}")
+def get_booking_report(
+    booking_id: str,
+    auth: AuthContext = Depends(require_owner_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    booking = session.get(Booking, booking_id)
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if auth.role == "owner" and auth.user_id != booking.owner_id:
+        raise HTTPException(status_code=403, detail="Owner cannot access this booking")
+
+    pet = session.get(Animal, booking.pet_id)
+    if not pet:
+        raise HTTPException(status_code=404, detail="Pet not found")
+
+    logs = list(
+        session.exec(
+            select(CareLog)
+            .where(CareLog.booking_id == booking_id)
+            .order_by(CareLog.at.asc())
+        )
+    )
+    zone_events = list(
+        session.exec(
+            select(PetZoneEvent)
+            .where(PetZoneEvent.pet_id == booking.pet_id)
+            .where(PetZoneEvent.at >= booking.start_at)
+            .where(PetZoneEvent.at <= booking.end_at)
+            .order_by(PetZoneEvent.at.asc())
+        )
+    )
+
+    events = list(
+        session.exec(
+            select(Event)
+            .where(Event.animal_id == booking.pet_id)
+            .where(Event.start_ts >= booking.start_at)
+            .where(Event.start_ts <= booking.end_at)
+            .order_by(Event.start_ts.asc())
+        )
+    )
+
+    clip_items: list[dict[str, Any]] = []
+    if events:
+        event_ids = [row.event_id for row in events]
+        clips = list(
+            session.exec(
+                select(Clip)
+                .where(Clip.event_id.in_(event_ids))
+                .order_by(Clip.start_ts.asc())
+            )
+        )
+        clip_items = [
+            {
+                "clip_id": row.clip_id,
+                "event_id": row.event_id,
+                "path": row.path,
+                "start_ts": row.start_ts,
+                "end_ts": row.end_ts,
+            }
+            for row in clips
+        ]
+
+    type_counts: dict[str, int] = {}
+    for row in logs:
+        type_counts[row.type] = type_counts.get(row.type, 0) + 1
+
+    return {
+        "booking": booking,
+        "pet": pet,
+        "summary": {
+            "care_log_count": len(logs),
+            "care_type_counts": type_counts,
+            "zone_move_count": len(zone_events),
+            "event_count": len(events),
+            "clip_count": len(clip_items),
+        },
+        "care_logs": [_serialize_care_log(row) for row in logs],
+        "zone_events": zone_events,
+        "events": events,
+        "clips": clip_items,
     }
 
 
