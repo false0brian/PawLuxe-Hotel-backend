@@ -68,10 +68,14 @@ python3 -c 'import json,sys;j=json.loads(sys.argv[1]);assert j.get("created_obse
 live_resp=$(curl -sS "$API_BASE/live/tracks/latest?camera_id=$room_cam_id&limit=10" -H "x-api-key: $API_KEY" "${ROLE_STAFF_HEADER[@]}")
 python3 -c 'import json,sys;j=json.loads(sys.argv[1]);assert "tracks" in j,j;print("live track count:",j.get("count",0))' "$live_resp"
 
-echo "[8/8] alert evaluate + list"
+echo "[8/9] alert evaluate + list"
 eval_resp=$(curl -sS -X POST "$API_BASE/system/alerts/evaluate" -H "x-api-key: $API_KEY" -H "x-role: system")
 python3 -c 'import json,sys;j=json.loads(sys.argv[1]);assert j.get("ok") is True,j;print("alert evaluate:",j.get("created_or_touched",0))' "$eval_resp"
 alerts_resp=$(curl -sS "$API_BASE/staff/alerts?status=open&limit=10" -H "x-api-key: $API_KEY" "${ROLE_STAFF_HEADER[@]}")
 python3 -c 'import json,sys;j=json.loads(sys.argv[1]);assert isinstance(j,list),j;print("open alerts:",len(j))' "$alerts_resp"
+
+echo "[9/9] auto clip generate"
+auto_clip_resp=$(curl -sS -X POST "$API_BASE/system/clips/auto-generate?window_seconds=600&max_clips=3" -H "x-api-key: $API_KEY" -H "x-role: system")
+python3 -c 'import json,sys;j=json.loads(sys.argv[1]);assert j.get("ok") is True,j;print("auto clip created:",j.get("created_count",0))' "$auto_clip_resp"
 
 echo "✅ multi-camera smoke passed"

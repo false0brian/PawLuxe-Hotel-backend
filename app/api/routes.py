@@ -390,6 +390,30 @@ def _evaluate_staff_alert_rules(
     return created
 
 
+def _find_segment_for_camera_ts(
+    session: Session,
+    *,
+    camera_id: str,
+    ts: datetime,
+    slack_seconds: int = 20,
+) -> MediaSegment | None:
+    ts_utc = _to_utc(ts)
+    row = session.exec(
+        select(MediaSegment)
+        .where(MediaSegment.camera_id == camera_id)
+        .where(MediaSegment.start_ts <= ts_utc + timedelta(seconds=slack_seconds))
+        .order_by(MediaSegment.start_ts.desc())
+        .limit(20)
+    ).first()
+    if not row:
+        return None
+    if row.end_ts is None:
+        return row
+    if _to_utc(row.end_ts) >= ts_utc - timedelta(seconds=slack_seconds):
+        return row
+    return None
+
+
 def _parse_bbox_xyxy(raw: str) -> list[float] | None:
     try:
         parsed = json.loads(raw)
@@ -1225,6 +1249,111 @@ def ingest_live_tracks(
         "created_tracks": created_tracks,
         "created_observations": created_observations,
         "created_associations": created_associations,
+    }
+
+
+@router.post("/system/clips/auto-generate")
+def generate_auto_clips(
+    window_seconds: int = Query(default=180, ge=30, le=3600),
+    max_clips: int = Query(default=5, ge=1, le=100),
+    per_animal_limit: int = Query(default=2, ge=1, le=10),
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    since = now - timedelta(seconds=window_seconds)
+
+    rows = list(
+        session.exec(
+            select(TrackObservation, Track)
+            .join(Track, TrackObservation.track_id == Track.track_id)
+            .where(TrackObservation.ts >= since)
+            .order_by(TrackObservation.ts.desc())
+            .limit(1000)
+        )
+    )
+    created: list[dict[str, Any]] = []
+    per_animal_counts: dict[str, int] = {}
+    seen_tracks: set[str] = set()
+
+    for obs, track in rows:
+        if len(created) >= max_clips:
+            break
+        if track.track_id in seen_tracks:
+            continue
+        seen_tracks.add(track.track_id)
+
+        assoc = session.exec(
+            select(Association)
+            .where(Association.track_id == track.track_id)
+            .order_by(Association.created_at.desc())
+            .limit(1)
+        ).first()
+        if not assoc or not assoc.animal_id:
+            continue
+        animal_id = assoc.animal_id
+        if per_animal_counts.get(animal_id, 0) >= per_animal_limit:
+            continue
+
+        # Avoid clip spam: skip if recent auto highlight already exists for this animal.
+        dup = session.exec(
+            select(Event)
+            .where(Event.animal_id == animal_id)
+            .where(Event.type == "auto_highlight")
+            .where(Event.start_ts >= obs.ts - timedelta(seconds=45))
+            .where(Event.start_ts <= obs.ts + timedelta(seconds=45))
+            .limit(1)
+        ).first()
+        if dup:
+            continue
+
+        start_ts = obs.ts - timedelta(seconds=5)
+        end_ts = obs.ts + timedelta(seconds=5)
+        event = Event(
+            animal_id=animal_id,
+            type="auto_highlight",
+            severity="info",
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        session.add(event)
+        session.flush()
+
+        segment = _find_segment_for_camera_ts(session, camera_id=track.camera_id, ts=obs.ts)
+        if segment:
+            path = segment.path
+            derived = segment.segment_id
+        else:
+            path = f"auto://{track.camera_id}/{event.event_id}.mp4"
+            derived = None
+
+        clip = Clip(
+            event_id=event.event_id,
+            path=path,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            derived_from_segments=derived,
+        )
+        session.add(clip)
+        per_animal_counts[animal_id] = per_animal_counts.get(animal_id, 0) + 1
+        created.append(
+            {
+                "clip_id": clip.clip_id,
+                "event_id": event.event_id,
+                "animal_id": animal_id,
+                "camera_id": track.camera_id,
+                "track_id": track.track_id,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "path": path,
+            }
+        )
+    session.commit()
+    return {
+        "ok": True,
+        "window_seconds": window_seconds,
+        "created_count": len(created),
+        "clips": created,
     }
 
 

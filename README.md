@@ -71,6 +71,9 @@ API_KEY=change-me \
 - `POST /api/v1/staff/alerts/{alert_id}/ack`: 알림 ack/resolved 처리
 - `WS /api/v1/ws/staff-alerts`: 스태프 알림 실시간 스트림
 
+## 자동 클립 API
+- `POST /api/v1/system/clips/auto-generate`: 최근 트랙 관측 기반 auto_highlight 이벤트/클립 생성
+
 ## 스트림 보안
 - `POST /api/v1/auth/stream-verify`는 `viewer_session_id` 기반 동시 세션 제한을 강제합니다.
 - `POST /api/v1/auth/stream-session/close`로 특정 viewer 세션을 명시 종료할 수 있습니다.

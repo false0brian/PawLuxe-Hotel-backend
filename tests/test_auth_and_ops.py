@@ -571,6 +571,71 @@ def test_system_ingest_and_alert_evaluate_flow() -> None:
     assert any(row["camera_id"] == cam_id for row in alerts)
 
 
+def test_system_auto_generate_clips() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+    pet_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "dog", "name": f"Milo-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert pet_resp.status_code == 200
+    pet_id = pet_resp.json()["animal_id"]
+
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": f"S1-PLAY-{suffix}"},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert cam_resp.status_code == 200
+    cam_id = cam_resp.json()["camera_id"]
+
+    track_resp = client.post("/api/v1/tracks", json={"camera_id": cam_id}, headers=_headers("admin", "admin-1"))
+    assert track_resp.status_code == 200
+    track_id = track_resp.json()["track_id"]
+
+    seg_resp = client.post(
+        "/api/v1/media-segments",
+        json={
+            "camera_id": cam_id,
+            "path": f"storage/uploads/segments/{suffix}.mp4",
+            "start_ts": (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat(),
+            "end_ts": (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat(),
+        },
+        headers=_headers("admin", "admin-1"),
+    )
+    assert seg_resp.status_code == 200
+
+    obs_resp = client.post(
+        f"/api/v1/tracks/{track_id}/observations",
+        json={"bbox": "[11,22,120,180]", "ts": datetime.now(timezone.utc).isoformat()},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert obs_resp.status_code == 200
+
+    assoc_resp = client.post(
+        "/api/v1/associations",
+        json={
+            "global_track_id": f"animal:{pet_id}",
+            "track_id": track_id,
+            "animal_id": pet_id,
+            "confidence": 0.9,
+        },
+        headers=_headers("admin", "admin-1"),
+    )
+    assert assoc_resp.status_code == 200
+
+    auto_resp = client.post(
+        "/api/v1/system/clips/auto-generate?window_seconds=300&max_clips=3",
+        headers=_headers("system"),
+    )
+    assert auto_resp.status_code == 200
+    body = auto_resp.json()
+    assert body["created_count"] >= 1
+    assert len(body["clips"]) >= 1
+    assert body["clips"][0]["animal_id"] == pet_id
+
+
 def test_staff_alerts_websocket_stream() -> None:
     suffix = str(uuid.uuid4())[:8]
     cam_resp = client.post(
