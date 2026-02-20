@@ -64,6 +64,7 @@ from app.schemas.domain import (
     PositionCreate,
     SessionCreateRequest,
     StaffAlertAckRequest,
+    StreamSessionCloseRequest,
     StreamTokenRequest,
     StreamVerifyRequest,
     TrackCreate,
@@ -1686,6 +1687,61 @@ def verify_stream_hook(
         auth=auth,
         session=session,
     )
+
+
+@router.post("/auth/stream-session/close")
+def close_stream_session(
+    payload: StreamSessionCloseRequest,
+    auth: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        claims = parse_and_verify(payload.token)
+    except ValueError as exc:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            result="denied",
+            reason=f"invalid_token:{exc}",
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    cam_ids = claims.get("cam_ids", [])
+    cam_for_check = payload.cam_id or (cam_ids[0] if cam_ids else None)
+    if not cam_for_check:
+        raise HTTPException(status_code=400, detail="cam_id is required")
+    if cam_for_check not in cam_ids:
+        raise HTTPException(status_code=403, detail="cam_id is not allowed by token")
+
+    token_fingerprint = hash_session_token(payload.token)
+    row = session.exec(
+        select(StreamPlaybackSession)
+        .where(StreamPlaybackSession.token_fingerprint == token_fingerprint)
+        .where(StreamPlaybackSession.cam_id == cam_for_check)
+        .where(StreamPlaybackSession.viewer_session_id == payload.viewer_session_id)
+        .order_by(StreamPlaybackSession.last_seen_at.desc())
+        .limit(1)
+    ).first()
+    if not row:
+        return {"ok": True, "closed": False}
+    row.active = False
+    row.last_seen_at = utcnow()
+    session.add(row)
+    session.commit()
+    _audit_stream(
+        session,
+        action="verify",
+        auth=auth,
+        owner_id=str(claims.get("sub", "")),
+        booking_id=str(claims.get("booking_id", "")),
+        pet_id=str(claims.get("pet_id", "")),
+        zone_id=str(claims.get("zone_id", "")),
+        cam_id=cam_for_check,
+        result="ok",
+        reason=f"session_closed:{payload.viewer_session_id}",
+    )
+    return {"ok": True, "closed": True, "viewer_session_id": payload.viewer_session_id}
 
 
 @router.get("/admin/stream-audit-logs")

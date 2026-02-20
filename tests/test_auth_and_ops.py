@@ -487,6 +487,21 @@ def test_stream_verify_enforces_session_limit() -> None:
     )
     assert v2.status_code == 403
 
+    close_resp = client.post(
+        "/api/v1/auth/stream-session/close",
+        json={"token": token, "cam_id": cam_id, "viewer_session_id": "device-a"},
+        headers=_headers("system"),
+    )
+    assert close_resp.status_code == 200
+    assert close_resp.json()["closed"] is True
+
+    v3 = client.post(
+        "/api/v1/auth/stream-verify",
+        json={"token": token, "cam_id": cam_id, "viewer_session_id": "device-b"},
+        headers=_headers("system"),
+    )
+    assert v3.status_code == 200
+
 
 def test_system_ingest_and_alert_evaluate_flow() -> None:
     suffix = str(uuid.uuid4())[:8]

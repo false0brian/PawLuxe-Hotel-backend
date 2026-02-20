@@ -158,6 +158,12 @@ class StreamVerifyRequest(BaseModel):
     viewer_session_id: str | None = None
 
 
+class StreamSessionCloseRequest(BaseModel):
+    token: str
+    cam_id: str | None = None
+    viewer_session_id: str
+
+
 class LiveTrackIngestDetection(BaseModel):
     source_track_id: str | int
     bbox_xyxy: list[float]

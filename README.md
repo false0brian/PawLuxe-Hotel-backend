@@ -73,6 +73,7 @@ API_KEY=change-me \
 
 ## 스트림 보안
 - `POST /api/v1/auth/stream-verify`는 `viewer_session_id` 기반 동시 세션 제한을 강제합니다.
+- `POST /api/v1/auth/stream-session/close`로 특정 viewer 세션을 명시 종료할 수 있습니다.
 - 토큰 응답에 `watermark` 문자열이 포함됩니다.
 
 ## Docker 스택
