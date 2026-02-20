@@ -691,6 +691,67 @@ def get_live_tracks_latest(
     }
 
 
+@router.get("/live/zones/summary")
+def get_live_zones_summary(
+    window_seconds: int = Query(default=10, ge=1, le=120),
+    camera_id: str | None = Query(default=None),
+    animal_id: str | None = Query(default=None),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    rows = _collect_live_tracks(
+        session=session,
+        camera_id=camera_id,
+        animal_id=animal_id,
+        since_ts=now - timedelta(seconds=window_seconds),
+        limit=300,
+    )
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        zone_id = row["zone_id"] or "UNKNOWN"
+        entry = buckets.get(zone_id)
+        if not entry:
+            entry = {
+                "zone_id": zone_id,
+                "track_ids": set(),
+                "animal_ids": set(),
+                "camera_ids": set(),
+                "observation_count": 0,
+                "last_ts": None,
+            }
+            buckets[zone_id] = entry
+        entry["observation_count"] += 1
+        entry["track_ids"].add(row["track_id"])
+        entry["camera_ids"].add(row["camera_id"])
+        if row["animal_id"]:
+            entry["animal_ids"].add(row["animal_id"])
+        ts = row["ts"]
+        if entry["last_ts"] is None or ts > entry["last_ts"]:
+            entry["last_ts"] = ts
+
+    zones = [
+        {
+            "zone_id": zone_id,
+            "camera_ids": sorted(entry["camera_ids"]),
+            "track_count": len(entry["track_ids"]),
+            "animal_count": len(entry["animal_ids"]),
+            "observation_count": entry["observation_count"],
+            "last_ts": entry["last_ts"],
+        }
+        for zone_id, entry in buckets.items()
+    ]
+    zones.sort(key=lambda it: (-it["observation_count"], it["zone_id"]))
+    return {
+        "at": now,
+        "window_seconds": window_seconds,
+        "zone_count": len(zones),
+        "total_observations": len(rows),
+        "zones": zones,
+    }
+
+
 @router.get("/live/cameras/{camera_id}/playback-url")
 def get_camera_playback_url(
     camera_id: str,

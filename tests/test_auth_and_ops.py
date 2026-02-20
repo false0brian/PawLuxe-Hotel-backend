@@ -313,3 +313,77 @@ def test_camera_playback_url_endpoint() -> None:
     body = playback_resp.json()
     assert body["camera_id"] == cam_id
     assert body["playback_url"].endswith(f"/{cam_id}")
+
+
+def test_live_zone_summary_endpoint() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+
+    animal_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "dog", "name": f"Milo-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert animal_resp.status_code == 200
+    pet_id = animal_resp.json()["animal_id"]
+
+    room_zone = f"S1-ROOM-{suffix}"
+    play_zone = f"S1-PLAY-{suffix}"
+    cam_room = client.post("/api/v1/cameras", json={"location_zone": room_zone}, headers=_headers("admin", "admin-1"))
+    cam_play = client.post("/api/v1/cameras", json={"location_zone": play_zone}, headers=_headers("admin", "admin-1"))
+    assert cam_room.status_code == 200
+    assert cam_play.status_code == 200
+    cam_room_id = cam_room.json()["camera_id"]
+    cam_play_id = cam_play.json()["camera_id"]
+
+    track_room = client.post("/api/v1/tracks", json={"camera_id": cam_room_id}, headers=_headers("admin", "admin-1"))
+    track_play = client.post("/api/v1/tracks", json={"camera_id": cam_play_id}, headers=_headers("admin", "admin-1"))
+    assert track_room.status_code == 200
+    assert track_play.status_code == 200
+    room_track_id = track_room.json()["track_id"]
+    play_track_id = track_play.json()["track_id"]
+
+    obs_room_1 = client.post(
+        f"/api/v1/tracks/{room_track_id}/observations",
+        json={"bbox": "[100,120,220,260]", "ts": datetime.now(timezone.utc).isoformat()},
+        headers=_headers("admin", "admin-1"),
+    )
+    obs_room_2 = client.post(
+        f"/api/v1/tracks/{room_track_id}/observations",
+        json={"bbox": "[110,125,230,265]", "ts": datetime.now(timezone.utc).isoformat()},
+        headers=_headers("admin", "admin-1"),
+    )
+    obs_play = client.post(
+        f"/api/v1/tracks/{play_track_id}/observations",
+        json={"bbox": "[10,20,80,120]", "ts": datetime.now(timezone.utc).isoformat()},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert obs_room_1.status_code == 200
+    assert obs_room_2.status_code == 200
+    assert obs_play.status_code == 200
+
+    assoc_resp = client.post(
+        "/api/v1/associations",
+        json={
+            "global_track_id": f"global-{suffix}",
+            "track_id": room_track_id,
+            "animal_id": pet_id,
+            "confidence": 0.95,
+        },
+        headers=_headers("admin", "admin-1"),
+    )
+    assert assoc_resp.status_code == 200
+
+    summary_resp = client.get(
+        "/api/v1/live/zones/summary?window_seconds=60",
+        headers=_headers("staff", "staff-1"),
+    )
+    assert summary_resp.status_code == 200
+    body = summary_resp.json()
+    assert body["zone_count"] >= 2
+    assert body["total_observations"] >= 3
+    room_rows = [z for z in body["zones"] if z["zone_id"] == room_zone]
+    assert room_rows
+    assert room_rows[0]["observation_count"] >= 2
+    assert room_rows[0]["track_count"] == 1
+    assert room_rows[0]["animal_count"] == 1
