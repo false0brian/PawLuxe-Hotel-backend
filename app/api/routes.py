@@ -2128,6 +2128,52 @@ def list_clips(
     return list(session.exec(query.order_by(Clip.start_ts.desc())))
 
 
+@router.get("/clips/{clip_id}/playback-url")
+def get_clip_playback_url(
+    clip_id: str,
+    auth: AuthContext = Depends(require_owner_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    clip = session.get(Clip, clip_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    if not clip.event_id:
+        raise HTTPException(status_code=400, detail="Clip is not linked to an event")
+    event = session.get(Event, clip.event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    animal = session.get(Animal, event.animal_id)
+    if not animal:
+        raise HTTPException(status_code=404, detail="Animal not found")
+    if auth.role == "owner" and auth.user_id != animal.owner_id:
+        raise HTTPException(status_code=403, detail="Owner cannot access this clip")
+
+    path = clip.path or ""
+    if path.startswith("http://") or path.startswith("https://"):
+        return {"clip_id": clip_id, "playback_url": path, "source": "direct"}
+
+    if path.startswith("auto://"):
+        # auto://{camera_id}/{event_id}.mp4
+        rest = path[len("auto://") :]
+        camera_id = rest.split("/", 1)[0].strip()
+        if not camera_id:
+            raise HTTPException(status_code=400, detail="Invalid auto clip path")
+        return {
+            "clip_id": clip_id,
+            "playback_url": f"{settings.stream_base_url}/{camera_id}",
+            "source": "camera_live_fallback",
+            "camera_id": camera_id,
+        }
+
+    return {
+        "clip_id": clip_id,
+        "playback_url": None,
+        "source": "unresolved_local_path",
+        "path": path,
+    }
+
+
 @router.get("/animals/{animal_id}/timeline")
 def get_animal_timeline(
     animal_id: str,

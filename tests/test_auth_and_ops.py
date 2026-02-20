@@ -295,6 +295,14 @@ def test_owner_dashboard_and_booking_report() -> None:
     assert report["summary"]["clip_count"] >= 1
     assert report["clips"][0]["event_type"] == "check"
 
+    playback_resp = client.get(
+        f"/api/v1/clips/{report['clips'][0]['clip_id']}/playback-url",
+        headers=_headers("owner", owner_id),
+    )
+    assert playback_resp.status_code == 200
+    pb = playback_resp.json()
+    assert pb["clip_id"] == report["clips"][0]["clip_id"]
+
 
 def test_camera_playback_url_endpoint() -> None:
     suffix = str(uuid.uuid4())[:8]

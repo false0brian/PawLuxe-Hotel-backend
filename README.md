@@ -74,6 +74,7 @@ API_KEY=change-me \
 ## 자동 클립 API
 - `POST /api/v1/system/clips/auto-generate`: 최근 트랙 관측 기반 auto_highlight 이벤트/클립 생성
 - `GET /api/v1/reports/bookings/{booking_id}`의 `clips[].event_type`으로 auto/manual 구분 가능
+- `GET /api/v1/clips/{clip_id}/playback-url`: 클립 재생 URL 해석 (auto clip은 camera live fallback)
 
 ## 스트림 보안
 - `POST /api/v1/auth/stream-verify`는 `viewer_session_id` 기반 동시 세션 제한을 강제합니다.
