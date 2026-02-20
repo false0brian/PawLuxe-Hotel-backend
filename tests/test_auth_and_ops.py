@@ -387,3 +387,48 @@ def test_live_zone_summary_endpoint() -> None:
     assert room_rows[0]["observation_count"] >= 2
     assert room_rows[0]["track_count"] == 1
     assert room_rows[0]["animal_count"] == 1
+
+
+def test_live_zone_heatmap_endpoint() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+    animal_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "dog", "name": f"Coco-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert animal_resp.status_code == 200
+
+    zone = f"S1-ROOM-{suffix}"
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": zone},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert cam_resp.status_code == 200
+    cam_id = cam_resp.json()["camera_id"]
+
+    track_resp = client.post("/api/v1/tracks", json={"camera_id": cam_id}, headers=_headers("admin", "admin-1"))
+    assert track_resp.status_code == 200
+    track_id = track_resp.json()["track_id"]
+
+    now = datetime.now(timezone.utc)
+    for sec in [2, 8, 14, 21]:
+        obs_resp = client.post(
+            f"/api/v1/tracks/{track_id}/observations",
+            json={"bbox": "[1,2,30,40]", "ts": (now - timedelta(seconds=sec)).isoformat()},
+            headers=_headers("admin", "admin-1"),
+        )
+        assert obs_resp.status_code == 200
+
+    heatmap_resp = client.get(
+        "/api/v1/live/zones/heatmap?window_seconds=30&bucket_seconds=5",
+        headers=_headers("staff", "staff-1"),
+    )
+    assert heatmap_resp.status_code == 200
+    body = heatmap_resp.json()
+    assert body["bucket_count"] == 6
+    zones = [z for z in body["zones"] if z["zone_id"] == zone]
+    assert zones
+    assert len(zones[0]["counts"]) == body["bucket_count"]
+    assert zones[0]["total_observations"] >= 4

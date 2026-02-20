@@ -58,6 +58,7 @@ API_KEY=change-me \
 ## 라이브 트랙/재생 API
 - `GET /api/v1/live/tracks/latest`: 최신 트랙(bbox/zone/animal) 조회
 - `GET /api/v1/live/zones/summary`: 존 단위 실시간 관측 집계
+- `GET /api/v1/live/zones/heatmap`: 존 단위 시간 버킷 히트맵 집계
 - `WS /api/v1/ws/live-tracks`: 실시간 트랙 스트림
 - `GET /api/v1/live/cameras/{camera_id}/playback-url`: 프론트 오버레이용 재생 URL 조회
 

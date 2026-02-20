@@ -752,6 +752,67 @@ def get_live_zones_summary(
     }
 
 
+@router.get("/live/zones/heatmap")
+def get_live_zones_heatmap(
+    window_seconds: int = Query(default=300, ge=10, le=3600),
+    bucket_seconds: int = Query(default=10, ge=1, le=300),
+    camera_id: str | None = Query(default=None),
+    animal_id: str | None = Query(default=None),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    bucket_count = max(1, min(240, window_seconds // max(1, bucket_seconds)))
+    now_epoch = int(now.timestamp())
+    aligned_now_epoch = now_epoch - (now_epoch % bucket_seconds)
+    start_epoch = aligned_now_epoch - (bucket_count - 1) * bucket_seconds
+
+    rows = _collect_live_tracks(
+        session=session,
+        camera_id=camera_id,
+        animal_id=animal_id,
+        since_ts=datetime.fromtimestamp(start_epoch, tz=timezone.utc),
+        limit=5000,
+    )
+
+    zone_counts: dict[str, list[int]] = {}
+    for row in rows:
+        zone_id = row["zone_id"] or "UNKNOWN"
+        ts_epoch = int(_to_utc(row["ts"]).timestamp())
+        idx = (ts_epoch - start_epoch) // bucket_seconds
+        if idx < 0 or idx >= bucket_count:
+            continue
+        counts = zone_counts.get(zone_id)
+        if counts is None:
+            counts = [0] * bucket_count
+            zone_counts[zone_id] = counts
+        counts[idx] += 1
+
+    bucket_starts = [
+        datetime.fromtimestamp(start_epoch + i * bucket_seconds, tz=timezone.utc)
+        for i in range(bucket_count)
+    ]
+    zones = []
+    for zone_id, counts in zone_counts.items():
+        zones.append(
+            {
+                "zone_id": zone_id,
+                "counts": counts,
+                "total_observations": sum(counts),
+                "max_bucket_count": max(counts) if counts else 0,
+            }
+        )
+    zones.sort(key=lambda it: (-it["total_observations"], it["zone_id"]))
+    return {
+        "at": now,
+        "window_seconds": window_seconds,
+        "bucket_seconds": bucket_seconds,
+        "bucket_count": bucket_count,
+        "bucket_starts": bucket_starts,
+        "zones": zones,
+    }
+
+
 @router.get("/live/cameras/{camera_id}/playback-url")
 def get_camera_playback_url(
     camera_id: str,
