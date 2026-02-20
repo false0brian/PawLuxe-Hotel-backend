@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: pawluxe-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pawluxe}
+      POSTGRES_USER: ${POSTGRES_USER:-pawluxe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pawluxe}
+    volumes:
+      - pawluxe_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pawluxe} -d ${POSTGRES_DB:-pawluxe}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.api
+    container_name: pawluxe-api
+    restart: unless-stopped
+    environment:
+      API_KEY: ${API_KEY:-change-me}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pawluxe:pawluxe@postgres:5432/pawluxe}
+      STREAM_SIGNING_KEY: ${STREAM_SIGNING_KEY:-change-me-stream-signing-key}
+      STREAM_TOKEN_TTL_SECONDS: ${STREAM_TOKEN_TTL_SECONDS:-120}
+      STREAM_BASE_URL: ${STREAM_BASE_URL:-http://localhost:8888}
+      OWNER_PLAY_LIVE_ENABLED: ${OWNER_PLAY_LIVE_ENABLED:-false}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080}
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  stream:
+    image: bluenviron/mediamtx:latest
+    container_name: pawluxe-stream
+    restart: unless-stopped
+    ports:
+      - "8554:8554"
+      - "8888:8888"
+      - "8889:8889"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.frontend
+      args:
+        VITE_API_BASE: /api/v1
+        VITE_API_KEY: ${API_KEY:-change-me}
+    container_name: pawluxe-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pawluxe_postgres_data:

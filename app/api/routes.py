@@ -1,0 +1,1462 @@
+import json
+from datetime import datetime, timedelta, timezone
+import secrets
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from sqlmodel import Session, select
+
+from app.core.auth import (
+    AuthContext,
+    hash_session_token,
+    require_admin_or_system,
+    require_owner_or_admin,
+    require_staff_or_admin,
+    verify_api_key,
+)
+from app.core.config import settings
+from app.db.models import (
+    AccessToken,
+    Animal,
+    Association,
+    AuthSession,
+    Booking,
+    Camera,
+    CameraHealth,
+    CareLog,
+    Clip,
+    Collar,
+    Event,
+    ExportJob,
+    GlobalIdentity,
+    MediaSegment,
+    PetZoneEvent,
+    Position,
+    StreamAuditLog,
+    Track,
+    TrackObservation,
+    User,
+    VideoAnalysis,
+    utcnow,
+)
+from app.db.session import get_session
+from app.schemas.domain import (
+    AnimalCreate,
+    AssociationCreate,
+    BookingCreate,
+    CameraCreate,
+    CareLogCreate,
+    ClipCreate,
+    CollarCreate,
+    EventCreate,
+    ExportJobCreate,
+    ExportRequest,
+    HighlightRequest,
+    IdentityUpsert,
+    MediaSegmentCreate,
+    PetZoneMoveCreate,
+    PositionCreate,
+    SessionCreateRequest,
+    StreamTokenRequest,
+    StreamVerifyRequest,
+    TrackCreate,
+    TrackObservationCreate,
+    UserCreate,
+    CameraHealthUpsert,
+)
+from app.services.export_service import (
+    build_export_plan,
+    build_highlight_plan,
+    load_manifest,
+    manifest_path_for_export,
+    render_export_video,
+    save_manifest,
+    video_path_for_export,
+)
+from app.services.storage_service import (
+    read_encrypted_analysis,
+    save_upload,
+    store_encrypted_analysis,
+)
+from app.services.stream_auth_service import parse_and_verify, sign_payload
+from app.services.tracking_service import track_video_with_yolo_deepsort
+from app.services.video_service import analyze_video
+
+router = APIRouter(dependencies=[Depends(verify_api_key)])
+
+
+def _timeline_item(kind: str, ts: datetime, payload: Any) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "ts": ts,
+        "data": payload.model_dump() if hasattr(payload, "model_dump") else payload,
+    }
+
+
+def _build_global_track_id(global_id_mode: str, camera_id: str, source_track_id: int, animal_id: str | None) -> str:
+    if global_id_mode == "animal" and animal_id:
+        return f"animal:{animal_id}"
+    return f"{camera_id}:{source_track_id}"
+
+
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _active_booking(session: Session, owner_id: str, booking_id: str, pet_id: str) -> Booking:
+    booking = session.get(Booking, booking_id)
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.owner_id != owner_id or booking.pet_id != pet_id:
+        raise HTTPException(status_code=403, detail="Booking owner/pet mismatch")
+    if booking.status not in {"reserved", "checked_in"}:
+        raise HTTPException(status_code=403, detail="Booking is not active")
+    now = utcnow()
+    if _to_utc(booking.start_at) > now or _to_utc(booking.end_at) < now:
+        raise HTTPException(status_code=403, detail="Booking not in active time window")
+    return booking
+
+
+def _pet_current_zone(session: Session, pet_id: str, booking: Booking) -> str:
+    row = session.exec(
+        select(PetZoneEvent).where(PetZoneEvent.pet_id == pet_id).order_by(PetZoneEvent.at.desc()).limit(1)
+    ).first()
+    if row:
+        return row.to_zone_id
+    return booking.room_zone_id
+
+
+def _allowed_cam_ids(session: Session, zone_id: str) -> list[str]:
+    rows = list(session.exec(select(Camera).where(Camera.location_zone == zone_id)))
+    return [row.camera_id for row in rows]
+
+
+def _is_play_zone(zone_id: str) -> bool:
+    upper = zone_id.upper()
+    if upper.startswith("PLAY"):
+        return True
+    parts = upper.split("-")
+    return len(parts) >= 2 and parts[1] == "PLAY"
+
+
+def _audit_stream(
+    session: Session,
+    *,
+    action: str,
+    auth: AuthContext,
+    owner_id: str | None = None,
+    booking_id: str | None = None,
+    pet_id: str | None = None,
+    zone_id: str | None = None,
+    cam_id: str | None = None,
+    result: str = "ok",
+    reason: str | None = None,
+) -> None:
+    row = StreamAuditLog(
+        action=action,
+        request_role=auth.role,
+        request_user_id=auth.user_id or None,
+        owner_id=owner_id,
+        booking_id=booking_id,
+        pet_id=pet_id,
+        zone_id=zone_id,
+        cam_id=cam_id,
+        result=result,
+        reason=reason,
+    )
+    session.add(row)
+    session.commit()
+
+
+@router.post("/animals")
+def create_animal(payload: AnimalCreate, session: Session = Depends(get_session)) -> Animal:
+    animal = Animal(**payload.model_dump())
+    session.add(animal)
+    session.commit()
+    session.refresh(animal)
+    return animal
+
+
+@router.get("/animals")
+def list_animals(
+    active: bool | None = Query(default=None), session: Session = Depends(get_session)
+) -> list[Animal]:
+    query = select(Animal)
+    if active is not None:
+        query = query.where(Animal.active == active)
+    return list(session.exec(query))
+
+
+@router.post("/auth/users")
+def create_user(
+    payload: UserCreate,
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> User:
+    role = payload.role.strip().lower()
+    if role not in {"owner", "staff", "admin", "system"}:
+        raise HTTPException(status_code=400, detail="role must be one of: owner, staff, admin, system")
+    user = User(role=role, email=payload.email, display_name=payload.display_name, active=payload.active)
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+@router.get("/auth/users")
+def list_users(
+    role: str | None = Query(default=None),
+    active: bool | None = Query(default=None),
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> list[User]:
+    query = select(User)
+    if role:
+        query = query.where(User.role == role.strip().lower())
+    if active is not None:
+        query = query.where(User.active == active)
+    return list(session.exec(query.order_by(User.created_at.desc())))
+
+
+@router.post("/auth/sessions")
+def create_auth_session(
+    payload: SessionCreateRequest,
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if payload.ttl_minutes < 5 or payload.ttl_minutes > 1440:
+        raise HTTPException(status_code=400, detail="ttl_minutes must be between 5 and 1440")
+    user = session.get(User, payload.user_id)
+    if not user or not user.active:
+        raise HTTPException(status_code=404, detail="Active user not found")
+
+    raw = f"psess_{secrets.token_urlsafe(32)}"
+    row = AuthSession(
+        user_id=user.user_id,
+        token_hash=hash_session_token(raw),
+        exp=utcnow() + timedelta(minutes=payload.ttl_minutes),
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return {
+        "session_token": raw,
+        "session_id": row.session_id,
+        "user_id": user.user_id,
+        "role": user.role,
+        "exp": row.exp,
+    }
+
+
+@router.post("/auth/sessions/{session_id}/revoke")
+def revoke_auth_session(
+    session_id: str,
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    row = session.get(AuthSession, session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.delete(row)
+    session.commit()
+    return {"status": "revoked", "session_id": session_id}
+
+
+@router.post("/cameras")
+def create_camera(payload: CameraCreate, session: Session = Depends(get_session)) -> Camera:
+    camera = Camera(**payload.model_dump())
+    session.add(camera)
+    session.commit()
+    session.refresh(camera)
+    return camera
+
+
+@router.get("/cameras")
+def list_cameras(session: Session = Depends(get_session)) -> list[Camera]:
+    return list(session.exec(select(Camera)))
+
+
+@router.post("/system/camera-health")
+def upsert_camera_health(
+    payload: CameraHealthUpsert,
+    _: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> CameraHealth:
+    if not session.get(Camera, payload.camera_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+    status = payload.status.strip().lower()
+    if status not in {"healthy", "degraded", "down", "unknown"}:
+        raise HTTPException(status_code=400, detail="status must be one of: healthy, degraded, down, unknown")
+
+    row = session.get(CameraHealth, payload.camera_id)
+    if not row:
+        row = CameraHealth(camera_id=payload.camera_id)
+    row.status = status
+    row.fps = payload.fps
+    row.latency_ms = payload.latency_ms
+    row.last_frame_at = payload.last_frame_at
+    row.reconnect_count = payload.reconnect_count
+    row.message = payload.message
+    row.updated_at = utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+@router.get("/admin/camera-health")
+def list_camera_health(
+    stale_seconds: int = Query(default=10, ge=1, le=600),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    now = utcnow()
+    rows = list(session.exec(select(CameraHealth).order_by(CameraHealth.updated_at.desc())))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        stale = True
+        if row.last_frame_at:
+            stale = (now - _to_utc(row.last_frame_at)).total_seconds() > stale_seconds
+        out.append(
+            {
+                "camera_id": row.camera_id,
+                "status": row.status,
+                "fps": row.fps,
+                "latency_ms": row.latency_ms,
+                "last_frame_at": row.last_frame_at,
+                "updated_at": row.updated_at,
+                "reconnect_count": row.reconnect_count,
+                "message": row.message,
+                "is_stale": stale,
+            }
+        )
+    return out
+
+
+@router.post("/bookings")
+def create_booking(payload: BookingCreate, session: Session = Depends(get_session)) -> Booking:
+    if not session.get(Animal, payload.pet_id):
+        raise HTTPException(status_code=404, detail="Pet not found")
+    data = payload.model_dump()
+    if data["end_at"] <= data["start_at"]:
+        raise HTTPException(status_code=400, detail="end_at must be after start_at")
+    booking = Booking(**data)
+    session.add(booking)
+    session.commit()
+    session.refresh(booking)
+    return booking
+
+
+@router.get("/bookings")
+def list_bookings(
+    owner_id: str | None = Query(default=None),
+    pet_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[Booking]:
+    query = select(Booking)
+    if owner_id:
+        query = query.where(Booking.owner_id == owner_id)
+    if pet_id:
+        query = query.where(Booking.pet_id == pet_id)
+    if status:
+        query = query.where(Booking.status == status)
+    return list(session.exec(query.order_by(Booking.start_at.desc())))
+
+
+@router.post("/staff/move-zone")
+def staff_move_zone(
+    payload: PetZoneMoveCreate,
+    auth: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> PetZoneEvent:
+    if not session.get(Animal, payload.pet_id):
+        raise HTTPException(status_code=404, detail="Pet not found")
+
+    prev = session.exec(
+        select(PetZoneEvent).where(PetZoneEvent.pet_id == payload.pet_id).order_by(PetZoneEvent.at.desc()).limit(1)
+    ).first()
+    row = PetZoneEvent(
+        pet_id=payload.pet_id,
+        from_zone_id=prev.to_zone_id if prev else None,
+        to_zone_id=payload.to_zone_id,
+        at=payload.at or utcnow(),
+        by_staff_id=payload.by_staff_id or auth.user_id,
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+@router.post("/staff/logs")
+def create_care_log(
+    payload: CareLogCreate,
+    auth: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> CareLog:
+    if not session.get(Animal, payload.pet_id):
+        raise HTTPException(status_code=404, detail="Pet not found")
+    booking = session.get(Booking, payload.booking_id)
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.pet_id != payload.pet_id:
+        raise HTTPException(status_code=400, detail="booking_id and pet_id mismatch")
+
+    allowed_types = {"feeding", "potty", "walk", "medication", "note"}
+    if payload.type not in allowed_types:
+        raise HTTPException(status_code=400, detail="type must be one of: feeding, potty, walk, medication, note")
+    value = payload.value.strip()
+    if not value and payload.details:
+        value = payload.type
+    if not value:
+        raise HTTPException(status_code=400, detail="value or details is required")
+
+    row = CareLog(
+        pet_id=payload.pet_id,
+        booking_id=payload.booking_id,
+        type=payload.type,
+        at=payload.at or utcnow(),
+        value=value,
+        value_json=json.dumps(payload.details, ensure_ascii=True) if payload.details is not None else None,
+        staff_id=payload.staff_id or auth.user_id,
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+@router.get("/pets/{pet_id}/status")
+def get_pet_status(
+    pet_id: str,
+    owner_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(require_owner_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    pet = session.get(Animal, pet_id)
+    if not pet:
+        raise HTTPException(status_code=404, detail="Pet not found")
+
+    if auth.role == "owner":
+        if pet.owner_id != auth.user_id:
+            raise HTTPException(status_code=403, detail="Owner cannot access this pet")
+        if owner_id and owner_id != auth.user_id:
+            raise HTTPException(status_code=403, detail="owner_id must match x-user-id")
+        owner_id = auth.user_id
+
+    now = utcnow()
+    booking_query = (
+        select(Booking)
+        .where(Booking.pet_id == pet_id)
+        .where(Booking.start_at <= now)
+        .where(Booking.end_at >= now)
+        .where(Booking.status.in_(["reserved", "checked_in"]))
+        .order_by(Booking.start_at.desc())
+        .limit(1)
+    )
+    if owner_id:
+        booking_query = booking_query.where(Booking.owner_id == owner_id)
+    booking = session.exec(booking_query).first()
+
+    latest_zone = session.exec(
+        select(PetZoneEvent).where(PetZoneEvent.pet_id == pet_id).order_by(PetZoneEvent.at.desc()).limit(1)
+    ).first()
+    current_zone = latest_zone.to_zone_id if latest_zone else (booking.room_zone_id if booking else None)
+    cam_ids = _allowed_cam_ids(session, current_zone) if current_zone else []
+
+    next_log = session.exec(
+        select(CareLog).where(CareLog.pet_id == pet_id).order_by(CareLog.at.desc()).limit(1)
+    ).first()
+    last_care_log_details: dict[str, Any] | None = None
+    if next_log and next_log.value_json:
+        try:
+            parsed = json.loads(next_log.value_json)
+            last_care_log_details = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            last_care_log_details = None
+
+    return {
+        "pet_id": pet_id,
+        "owner_id": pet.owner_id,
+        "booking_id": booking.booking_id if booking else None,
+        "status": "active" if booking else "idle",
+        "current_zone_id": current_zone,
+        "cam_ids": cam_ids,
+        "last_zone_event_at": latest_zone.at if latest_zone else None,
+        "last_care_log": next_log,
+        "last_care_log_details": last_care_log_details,
+    }
+
+
+@router.post("/auth/stream-token")
+def create_stream_token(
+    payload: StreamTokenRequest,
+    auth: AuthContext = Depends(require_owner_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if auth.role == "owner" and payload.owner_id != auth.user_id:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            owner_id=payload.owner_id,
+            booking_id=payload.booking_id,
+            pet_id=payload.pet_id,
+            result="denied",
+            reason="owner_id_mismatch",
+        )
+        raise HTTPException(status_code=403, detail="owner_id must match x-user-id")
+    if payload.max_sessions < 1 or payload.max_sessions > 4:
+        raise HTTPException(status_code=400, detail="max_sessions must be between 1 and 4")
+    if not session.get(Animal, payload.pet_id):
+        raise HTTPException(status_code=404, detail="Pet not found")
+
+    booking = _active_booking(
+        session=session,
+        owner_id=payload.owner_id,
+        booking_id=payload.booking_id,
+        pet_id=payload.pet_id,
+    )
+    current_zone = _pet_current_zone(session, payload.pet_id, booking)
+    if auth.role == "owner" and _is_play_zone(current_zone) and not settings.owner_play_live_enabled:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            owner_id=payload.owner_id,
+            booking_id=payload.booking_id,
+            pet_id=payload.pet_id,
+            zone_id=current_zone,
+            result="denied",
+            reason="owner_play_live_disabled",
+        )
+        raise HTTPException(status_code=403, detail="PLAY live is disabled for owners. Use highlights.")
+    cam_ids = _allowed_cam_ids(session, current_zone)
+    if not cam_ids:
+        raise HTTPException(status_code=404, detail="No cameras available for current zone")
+
+    ttl_seconds = payload.ttl_seconds or settings.stream_token_ttl_seconds
+    if ttl_seconds < 60 or ttl_seconds > 180:
+        raise HTTPException(status_code=400, detail="ttl_seconds must be between 60 and 180")
+
+    now = utcnow()
+    exp = now + timedelta(seconds=ttl_seconds)
+    claims = {
+        "sub": payload.owner_id,
+        "booking_id": payload.booking_id,
+        "pet_id": payload.pet_id,
+        "zone_id": current_zone,
+        "cam_ids": cam_ids,
+        "exp": int(exp.timestamp()),
+        "max_sessions": payload.max_sessions,
+        "watermark": f"{payload.booking_id}|{now.isoformat()}",
+    }
+    token = sign_payload(claims)
+
+    for cam_id in cam_ids:
+        row = AccessToken(
+            owner_id=payload.owner_id,
+            booking_id=payload.booking_id,
+            pet_id=payload.pet_id,
+            cam_id=cam_id,
+            exp=exp,
+            sessions=payload.max_sessions,
+        )
+        session.add(row)
+    session.commit()
+    for cam_id in cam_ids:
+        _audit_stream(
+            session,
+            action="issue",
+            auth=auth,
+            owner_id=payload.owner_id,
+            booking_id=payload.booking_id,
+            pet_id=payload.pet_id,
+            zone_id=current_zone,
+            cam_id=cam_id,
+            result="ok",
+        )
+
+    stream_urls = [f"{settings.stream_base_url}/{cam_id}?token={token}" for cam_id in cam_ids]
+    return {
+        "token": token,
+        "exp": exp,
+        "zone_id": current_zone,
+        "cam_ids": cam_ids,
+        "stream_urls": stream_urls,
+    }
+
+
+@router.post("/auth/stream-verify")
+def verify_stream_token(
+    payload: StreamVerifyRequest,
+    auth: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        claims = parse_and_verify(payload.token)
+    except ValueError as exc:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            result="denied",
+            reason=f"invalid_token:{exc}",
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    cam_ids = claims.get("cam_ids", [])
+    if payload.cam_id and payload.cam_id not in cam_ids:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            owner_id=str(claims.get("sub", "")),
+            booking_id=str(claims.get("booking_id", "")),
+            pet_id=str(claims.get("pet_id", "")),
+            zone_id=str(claims.get("zone_id", "")),
+            cam_id=payload.cam_id,
+            result="denied",
+            reason="cam_not_allowed",
+        )
+        raise HTTPException(status_code=403, detail="cam_id is not allowed by token")
+
+    cam_for_check = payload.cam_id or (cam_ids[0] if cam_ids else None)
+    if not cam_for_check:
+        raise HTTPException(status_code=403, detail="Token does not contain cam_ids")
+
+    row = session.exec(
+        select(AccessToken)
+        .where(AccessToken.owner_id == str(claims.get("sub", "")))
+        .where(AccessToken.booking_id == str(claims.get("booking_id", "")))
+        .where(AccessToken.pet_id == str(claims.get("pet_id", "")))
+        .where(AccessToken.cam_id == cam_for_check)
+        .where(AccessToken.exp >= utcnow())
+        .order_by(AccessToken.created_at.desc())
+        .limit(1)
+    ).first()
+    if not row:
+        _audit_stream(
+            session,
+            action="deny",
+            auth=auth,
+            owner_id=str(claims.get("sub", "")),
+            booking_id=str(claims.get("booking_id", "")),
+            pet_id=str(claims.get("pet_id", "")),
+            zone_id=str(claims.get("zone_id", "")),
+            cam_id=cam_for_check,
+            result="denied",
+            reason="missing_persisted_token",
+        )
+        raise HTTPException(status_code=403, detail="No valid persisted access token found")
+
+    _audit_stream(
+        session,
+        action="verify",
+        auth=auth,
+        owner_id=str(claims.get("sub", "")),
+        booking_id=str(claims.get("booking_id", "")),
+        pet_id=str(claims.get("pet_id", "")),
+        zone_id=str(claims.get("zone_id", "")),
+        cam_id=cam_for_check,
+        result="ok",
+    )
+
+    return {
+        "ok": True,
+        "cam_id": cam_for_check,
+        "max_sessions": int(claims.get("max_sessions", 1)),
+        "exp": int(claims.get("exp", 0)),
+    }
+
+
+@router.get("/auth/stream-verify-hook")
+def verify_stream_hook(
+    token: str = Query(...),
+    cam_id: str = Query(...),
+    auth: AuthContext = Depends(require_admin_or_system),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    return verify_stream_token(
+        payload=StreamVerifyRequest(token=token, cam_id=cam_id),
+        auth=auth,
+        session=session,
+    )
+
+
+@router.get("/admin/stream-audit-logs")
+def list_stream_audit_logs(
+    limit: int = Query(default=100, ge=1, le=1000),
+    result: str | None = Query(default=None),
+    action: str | None = Query(default=None),
+    _auth: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> list[StreamAuditLog]:
+    query = select(StreamAuditLog)
+    if result:
+        query = query.where(StreamAuditLog.result == result)
+    if action:
+        query = query.where(StreamAuditLog.action == action)
+    query = query.order_by(StreamAuditLog.at.desc()).limit(limit)
+    return list(session.exec(query))
+
+
+@router.post("/collars")
+def create_collar(payload: CollarCreate, session: Session = Depends(get_session)) -> Collar:
+    if not session.get(Animal, payload.animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    data = payload.model_dump()
+    data["start_ts"] = payload.start_ts or utcnow()
+    collar = Collar(**data)
+    session.add(collar)
+    session.commit()
+    session.refresh(collar)
+    return collar
+
+
+@router.get("/collars")
+def list_collars(
+    animal_id: str | None = Query(default=None), session: Session = Depends(get_session)
+) -> list[Collar]:
+    query = select(Collar)
+    if animal_id:
+        query = query.where(Collar.animal_id == animal_id)
+    return list(session.exec(query.order_by(Collar.start_ts.desc())))
+
+
+@router.post("/tracks")
+def create_track(payload: TrackCreate, session: Session = Depends(get_session)) -> Track:
+    if not session.get(Camera, payload.camera_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    data = payload.model_dump()
+    data["start_ts"] = payload.start_ts or utcnow()
+    track = Track(**data)
+    session.add(track)
+    session.commit()
+    session.refresh(track)
+    return track
+
+
+@router.get("/tracks")
+def list_tracks(
+    camera_id: str | None = Query(default=None), session: Session = Depends(get_session)
+) -> list[Track]:
+    query = select(Track)
+    if camera_id:
+        query = query.where(Track.camera_id == camera_id)
+    return list(session.exec(query.order_by(Track.start_ts.desc())))
+
+
+@router.post("/tracks/{track_id}/observations")
+def create_track_observation(
+    track_id: str,
+    payload: TrackObservationCreate,
+    session: Session = Depends(get_session),
+) -> TrackObservation:
+    if not session.get(Track, track_id):
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    data = payload.model_dump()
+    data["track_id"] = track_id
+    data["ts"] = payload.ts or utcnow()
+    observation = TrackObservation(**data)
+    session.add(observation)
+    session.commit()
+    session.refresh(observation)
+    return observation
+
+
+@router.get("/tracks/{track_id}/observations")
+def list_track_observations(
+    track_id: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    session: Session = Depends(get_session),
+) -> list[TrackObservation]:
+    if not session.get(Track, track_id):
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    query = (
+        select(TrackObservation)
+        .where(TrackObservation.track_id == track_id)
+        .order_by(TrackObservation.ts.desc())
+        .limit(limit)
+    )
+    return list(session.exec(query))
+
+
+@router.post("/associations")
+def create_association(
+    payload: AssociationCreate, session: Session = Depends(get_session)
+) -> Association:
+    if not session.get(Track, payload.track_id):
+        raise HTTPException(status_code=404, detail="Track not found")
+    if not session.get(Animal, payload.animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    association = Association(**payload.model_dump())
+    session.add(association)
+    session.commit()
+    session.refresh(association)
+    return association
+
+
+@router.get("/associations")
+def list_associations(
+    animal_id: str | None = Query(default=None),
+    global_track_id: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[Association]:
+    query = select(Association)
+    if animal_id:
+        query = query.where(Association.animal_id == animal_id)
+    if global_track_id:
+        query = query.where(Association.global_track_id == global_track_id)
+    return list(session.exec(query.order_by(Association.created_at.desc())))
+
+
+@router.get("/identities/{global_track_id}")
+def get_identity(global_track_id: str, session: Session = Depends(get_session)) -> GlobalIdentity:
+    row = session.get(GlobalIdentity, global_track_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    return row
+
+
+@router.put("/identities/{global_track_id}/animal")
+def upsert_identity_animal(
+    global_track_id: str,
+    payload: IdentityUpsert,
+    session: Session = Depends(get_session),
+) -> GlobalIdentity:
+    if payload.state not in {"unknown", "confirmed"}:
+        raise HTTPException(status_code=400, detail="state must be one of: unknown, confirmed")
+    if payload.animal_id and not session.get(Animal, payload.animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    row = session.get(GlobalIdentity, global_track_id)
+    if not row:
+        row = GlobalIdentity(global_track_id=global_track_id)
+    row.animal_id = payload.animal_id
+    row.state = payload.state
+    row.source = payload.source
+    row.updated_at = utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+@router.post("/events")
+def create_event(payload: EventCreate, session: Session = Depends(get_session)) -> Event:
+    if not session.get(Animal, payload.animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    data = payload.model_dump()
+    data["start_ts"] = payload.start_ts or utcnow()
+    event = Event(**data)
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+    return event
+
+
+@router.get("/events")
+def list_events(
+    animal_id: str | None = Query(default=None), session: Session = Depends(get_session)
+) -> list[Event]:
+    query = select(Event)
+    if animal_id:
+        query = query.where(Event.animal_id == animal_id)
+    query = query.order_by(Event.start_ts.desc())
+    return list(session.exec(query))
+
+
+@router.post("/positions")
+def create_position(payload: PositionCreate, session: Session = Depends(get_session)) -> Position:
+    if not session.get(Animal, payload.animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    data = payload.model_dump()
+    data["ts"] = payload.ts or utcnow()
+    position = Position(**data)
+    session.add(position)
+    session.commit()
+    session.refresh(position)
+    return position
+
+
+@router.post("/media-segments")
+def create_media_segment(
+    payload: MediaSegmentCreate, session: Session = Depends(get_session)
+) -> MediaSegment:
+    if payload.camera_id and not session.get(Camera, payload.camera_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    data = payload.model_dump()
+    data["start_ts"] = payload.start_ts or utcnow()
+    segment = MediaSegment(**data)
+    session.add(segment)
+    session.commit()
+    session.refresh(segment)
+    return segment
+
+
+@router.get("/media-segments")
+def list_media_segments(
+    camera_id: str | None = Query(default=None), session: Session = Depends(get_session)
+) -> list[MediaSegment]:
+    query = select(MediaSegment)
+    if camera_id:
+        query = query.where(MediaSegment.camera_id == camera_id)
+    return list(session.exec(query.order_by(MediaSegment.start_ts.desc())))
+
+
+@router.post("/clips")
+def create_clip(payload: ClipCreate, session: Session = Depends(get_session)) -> Clip:
+    if payload.event_id and not session.get(Event, payload.event_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    data = payload.model_dump()
+    data["start_ts"] = payload.start_ts or utcnow()
+    clip = Clip(**data)
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return clip
+
+
+@router.get("/clips")
+def list_clips(
+    event_id: str | None = Query(default=None), session: Session = Depends(get_session)
+) -> list[Clip]:
+    query = select(Clip)
+    if event_id:
+        query = query.where(Clip.event_id == event_id)
+    return list(session.exec(query.order_by(Clip.start_ts.desc())))
+
+
+@router.get("/animals/{animal_id}/timeline")
+def get_animal_timeline(
+    animal_id: str,
+    from_ts: datetime | None = Query(default=None),
+    to_ts: datetime | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    animal = session.get(Animal, animal_id)
+    if not animal:
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    events_query = select(Event).where(Event.animal_id == animal_id)
+    positions_query = select(Position).where(Position.animal_id == animal_id)
+    analyses_query = select(VideoAnalysis).where(VideoAnalysis.animal_id == animal_id)
+
+    if from_ts:
+        events_query = events_query.where(Event.start_ts >= from_ts)
+        positions_query = positions_query.where(Position.ts >= from_ts)
+        analyses_query = analyses_query.where(VideoAnalysis.created_at >= from_ts)
+    if to_ts:
+        events_query = events_query.where(Event.start_ts <= to_ts)
+        positions_query = positions_query.where(Position.ts <= to_ts)
+        analyses_query = analyses_query.where(VideoAnalysis.created_at <= to_ts)
+
+    events = list(session.exec(events_query.order_by(Event.start_ts.desc()).limit(200)))
+    positions = list(session.exec(positions_query.order_by(Position.ts.desc()).limit(200)))
+    analyses = list(session.exec(analyses_query.order_by(VideoAnalysis.created_at.desc()).limit(50)))
+
+    timeline = [
+        *[_timeline_item("event", row.start_ts, row) for row in events],
+        *[_timeline_item("position", row.ts, row) for row in positions],
+        *[_timeline_item("video_analysis", row.created_at, row) for row in analyses],
+    ]
+    timeline.sort(key=lambda item: item["ts"], reverse=True)
+
+    return {
+        "animal": animal,
+        "events": events,
+        "positions": positions,
+        "video_analyses": analyses,
+        "timeline": timeline,
+    }
+
+
+@router.post("/videos/process")
+async def process_video(
+    file: UploadFile = File(...),
+    animal_id: str | None = Form(default=None),
+    camera_id: str | None = Form(default=None),
+    event_type: str | None = Form(default=None),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File name is required")
+
+    if not file.content_type or not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Only video files are allowed")
+
+    if animal_id and not session.get(Animal, animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+    if camera_id and not session.get(Camera, camera_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    video_id, video_path = await save_upload(file)
+    analysis = analyze_video(video_path)
+    encrypted_path = store_encrypted_analysis(video_id, analysis)
+
+    now = utcnow()
+    analysis_row = VideoAnalysis(
+        video_id=video_id,
+        animal_id=animal_id,
+        camera_id=camera_id,
+        filename=file.filename,
+        uploaded_path=str(video_path),
+        encrypted_analysis_path=str(encrypted_path),
+        duration_seconds=analysis["duration_seconds"],
+        fps=analysis["fps"],
+        total_frames=analysis["total_frames"],
+        sampled_frames=analysis["sampled_frames"],
+        avg_motion_score=analysis["avg_motion_score"],
+        avg_brightness=analysis["avg_brightness"],
+        created_at=now,
+    )
+    session.add(analysis_row)
+
+    segment = MediaSegment(
+        camera_id=camera_id,
+        start_ts=now,
+        end_ts=now + timedelta(seconds=analysis["duration_seconds"]),
+        path=str(video_path),
+        codec=file.content_type,
+    )
+    session.add(segment)
+
+    created_event: Event | None = None
+    if event_type and animal_id:
+        created_event = Event(
+            animal_id=animal_id,
+            type=event_type,
+            severity="info",
+            start_ts=now,
+            end_ts=now + timedelta(seconds=analysis["duration_seconds"]),
+        )
+        session.add(created_event)
+
+    session.commit()
+    if created_event:
+        session.refresh(created_event)
+
+    return {
+        "video_id": video_id,
+        "filename": file.filename,
+        "analysis_encrypted_path": str(encrypted_path),
+        "event_id": created_event.event_id if created_event else None,
+        "summary": {
+            "duration_seconds": analysis["duration_seconds"],
+            "fps": analysis["fps"],
+            "total_frames": analysis["total_frames"],
+            "sampled_frames": analysis["sampled_frames"],
+            "avg_motion_score": analysis["avg_motion_score"],
+            "avg_brightness": analysis["avg_brightness"],
+        },
+    }
+
+
+@router.post("/videos/track")
+async def track_video(
+    file: UploadFile = File(...),
+    camera_id: str = Form(...),
+    animal_id: str | None = Form(default=None),
+    conf_threshold: float = Form(default=0.25),
+    iou_threshold: float = Form(default=0.45),
+    frame_stride: int = Form(default=1),
+    max_frames: int = Form(default=0),
+    classes_csv: str = Form(default="15,16"),
+    global_id_mode: str = Form(default="animal"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File name is required")
+
+    if not file.content_type or not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Only video files are allowed")
+
+    camera = session.get(Camera, camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    if animal_id and not session.get(Animal, animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    if frame_stride < 1:
+        raise HTTPException(status_code=400, detail="frame_stride must be >= 1")
+    if global_id_mode not in {"animal", "camera_track"}:
+        raise HTTPException(status_code=400, detail="global_id_mode must be one of: animal, camera_track")
+
+    classes: list[int] | None = None
+    classes_csv = classes_csv.strip()
+    if classes_csv:
+        try:
+            classes = [int(value.strip()) for value in classes_csv.split(",") if value.strip()]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="classes_csv must be comma-separated integers") from exc
+
+    video_id, video_path = await save_upload(file)
+
+    try:
+        tracking = track_video_with_yolo_deepsort(
+            video_path=video_path,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            frame_stride=frame_stride,
+            max_frames=max_frames,
+            classes=classes,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    now = utcnow()
+    analysis_row = VideoAnalysis(
+        video_id=video_id,
+        animal_id=animal_id,
+        camera_id=camera_id,
+        filename=file.filename,
+        uploaded_path=str(video_path),
+        encrypted_analysis_path="",
+        duration_seconds=float(tracking["duration_seconds"]),
+        fps=float(tracking["fps"]),
+        total_frames=int(tracking["total_frames"]),
+        sampled_frames=int(tracking["processed_frames"]),
+        avg_motion_score=0.0,
+        avg_brightness=0.0,
+        created_at=now,
+    )
+    session.add(analysis_row)
+
+    segment = MediaSegment(
+        camera_id=camera_id,
+        start_ts=now,
+        end_ts=now + timedelta(seconds=float(tracking["duration_seconds"])),
+        path=str(video_path),
+        codec=file.content_type,
+    )
+    session.add(segment)
+
+    persisted_tracks = 0
+    persisted_observations = 0
+    persisted_associations = 0
+    for source_track in tracking["tracks"]:
+        observations = source_track["observations"]
+        if not observations:
+            continue
+
+        start_ts = now + timedelta(seconds=float(observations[0]["ts_seconds"]))
+        end_ts = now + timedelta(seconds=float(observations[-1]["ts_seconds"]))
+        track_row = Track(
+            camera_id=camera_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            quality_score=float(source_track["avg_confidence"]),
+        )
+        session.add(track_row)
+        session.flush()
+        persisted_tracks += 1
+
+        for obs in observations:
+            bbox_json = json.dumps([round(float(v), 3) for v in obs["bbox_xyxy"]], ensure_ascii=True)
+            appearance_ref = f"class:{int(obs['class_id'])};conf:{float(obs['conf']):.6f}"
+            row = TrackObservation(
+                track_id=track_row.track_id,
+                ts=now + timedelta(seconds=float(obs["ts_seconds"])),
+                bbox=bbox_json,
+                marker_id_read=None,
+                appearance_vec_ref=appearance_ref,
+            )
+            session.add(row)
+            persisted_observations += 1
+
+        if animal_id:
+            association = Association(
+                global_track_id=_build_global_track_id(
+                    global_id_mode,
+                    camera_id,
+                    int(source_track["source_track_id"]),
+                    animal_id,
+                ),
+                track_id=track_row.track_id,
+                animal_id=animal_id,
+                confidence=float(source_track["avg_confidence"]),
+            )
+            session.add(association)
+            persisted_associations += 1
+
+    session.commit()
+
+    return {
+        "video_id": video_id,
+        "camera_id": camera_id,
+        "animal_id": animal_id,
+        "tracking_summary": {
+            "fps": tracking["fps"],
+            "total_frames": tracking["total_frames"],
+            "processed_frames": tracking["processed_frames"],
+            "duration_seconds": tracking["duration_seconds"],
+            "total_detections": tracking["total_detections"],
+            "track_count": tracking["track_count"],
+        },
+        "db_persisted": {
+            "tracks": persisted_tracks,
+            "observations": persisted_observations,
+            "associations": persisted_associations,
+        },
+    }
+
+
+@router.get("/videos/{video_id}/analysis")
+def get_analysis(video_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    row = session.get(VideoAnalysis, video_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Analysis metadata not found")
+
+    try:
+        decrypted = read_encrypted_analysis(video_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Encrypted analysis file not found") from exc
+
+    return {
+        "metadata": row,
+        "analysis": decrypted,
+    }
+
+
+@router.post("/exports/global-track/{global_track_id}")
+def export_global_track(
+    global_track_id: str,
+    payload: ExportRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        excerpts, summary = build_export_plan(
+            session=session,
+            global_track_id=global_track_id,
+            padding_seconds=payload.padding_seconds,
+            merge_gap_seconds=payload.merge_gap_seconds,
+            min_duration_seconds=payload.min_duration_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    export_id, manifest_path = save_manifest(
+        global_track_id=global_track_id,
+        summary=summary,
+        excerpts=excerpts,
+    )
+
+    video_path: str | None = None
+    render_error: str | None = None
+    if payload.render_video:
+        try:
+            video_path = str(render_export_video(export_id=export_id, excerpts=excerpts))
+        except Exception as exc:
+            render_error = str(exc)
+
+    return {
+        "export_id": export_id,
+        "global_track_id": global_track_id,
+        "summary": summary,
+        "manifest_path": str(manifest_path),
+        "video_path": video_path,
+        "render_error": render_error,
+    }
+
+
+@router.post("/exports/global-track/{global_track_id}/highlights")
+def export_global_track_highlights(
+    global_track_id: str,
+    payload: HighlightRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        excerpts, summary = build_export_plan(
+            session=session,
+            global_track_id=global_track_id,
+            padding_seconds=payload.padding_seconds,
+            merge_gap_seconds=payload.merge_gap_seconds,
+            min_duration_seconds=payload.min_duration_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    highlights = build_highlight_plan(
+        excerpts=excerpts,
+        target_seconds=payload.target_seconds,
+        per_clip_seconds=payload.per_clip_seconds,
+    )
+    if not highlights:
+        raise HTTPException(status_code=404, detail="No highlight excerpts available")
+
+    summary["mode"] = "highlights"
+    summary["target_seconds"] = payload.target_seconds
+    summary["per_clip_seconds"] = payload.per_clip_seconds
+    summary["highlight_excerpt_count"] = len(highlights)
+
+    export_id, manifest_path = save_manifest(
+        global_track_id=global_track_id,
+        summary=summary,
+        excerpts=highlights,
+    )
+
+    video_path: str | None = None
+    render_error: str | None = None
+    try:
+        video_path = str(render_export_video(export_id=export_id, excerpts=highlights))
+    except Exception as exc:
+        render_error = str(exc)
+
+    return {
+        "export_id": export_id,
+        "global_track_id": global_track_id,
+        "summary": summary,
+        "manifest_path": str(manifest_path),
+        "video_path": video_path,
+        "render_error": render_error,
+    }
+
+
+@router.post("/exports/global-track/{global_track_id}/jobs")
+def create_export_job(
+    global_track_id: str,
+    payload: ExportJobCreate,
+    session: Session = Depends(get_session),
+) -> ExportJob:
+    mode = payload.mode.strip().lower()
+    if mode not in {"full", "highlights"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: full, highlights")
+
+    if payload.max_retries < 0:
+        raise HTTPException(status_code=400, detail="max_retries must be >= 0")
+
+    payload_data = payload.model_dump(exclude={"mode", "dedupe", "max_retries"})
+    payload_json = json.dumps(payload_data, ensure_ascii=True)
+
+    if payload.dedupe:
+        existing_query = (
+            select(ExportJob)
+            .where(ExportJob.global_track_id == global_track_id)
+            .where(ExportJob.mode == mode)
+            .where(ExportJob.payload_json == payload_json)
+            .where(ExportJob.status.in_(["pending", "running"]))
+            .where(ExportJob.canceled_at.is_(None))
+            .order_by(ExportJob.created_at.desc())
+            .limit(1)
+        )
+        existing = session.exec(existing_query).first()
+        if existing:
+            return existing
+
+    job = ExportJob(
+        global_track_id=global_track_id,
+        mode=mode,
+        status="pending",
+        payload_json=payload_json,
+        max_retries=payload.max_retries,
+        retry_count=0,
+        next_run_at=utcnow(),
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return job
+
+
+@router.get("/exports/jobs/{job_id}")
+def get_export_job(job_id: str, session: Session = Depends(get_session)) -> ExportJob:
+    job = session.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return job
+
+
+@router.post("/exports/jobs/{job_id}/cancel")
+def cancel_export_job(job_id: str, session: Session = Depends(get_session)) -> ExportJob:
+    job = session.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    if job.status in {"done", "failed", "canceled"}:
+        return job
+
+    job.status = "canceled"
+    job.canceled_at = utcnow()
+    job.next_run_at = None
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return job
+
+
+@router.post("/exports/jobs/{job_id}/retry")
+def retry_export_job(job_id: str, session: Session = Depends(get_session)) -> ExportJob:
+    job = session.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    if job.status not in {"failed", "canceled"}:
+        raise HTTPException(status_code=400, detail="Only failed/canceled jobs can be retried")
+
+    job.status = "pending"
+    job.error_message = None
+    job.started_at = None
+    job.finished_at = None
+    job.canceled_at = None
+    job.next_run_at = utcnow()
+    job.retry_count = 0
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return job
+
+
+@router.get("/exports/{export_id}")
+def get_export(
+    export_id: str,
+    download: str | None = Query(default=None),
+) -> Any:
+    manifest_path = manifest_path_for_export(export_id)
+    video_path = video_path_for_export(export_id)
+
+    if download:
+        kind = download.strip().lower()
+        if kind == "manifest":
+            if not manifest_path.exists():
+                raise HTTPException(status_code=404, detail="Manifest not found")
+            return FileResponse(
+                path=str(manifest_path),
+                media_type="application/json",
+                filename=f"{export_id}.json",
+            )
+        if kind == "video":
+            if not video_path.exists():
+                raise HTTPException(status_code=404, detail="Video not found")
+            return FileResponse(
+                path=str(video_path),
+                media_type="video/mp4",
+                filename=f"{export_id}.mp4",
+            )
+        raise HTTPException(status_code=400, detail="download must be one of: manifest, video")
+
+    manifest_data = None
+    if manifest_path.exists():
+        try:
+            manifest_data = load_manifest(export_id)
+        except Exception:
+            manifest_data = None
+
+    return {
+        "export_id": export_id,
+        "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+        "video_path": str(video_path) if video_path.exists() else None,
+        "manifest": manifest_data,
+    }

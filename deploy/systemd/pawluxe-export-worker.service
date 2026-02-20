@@ -1,0 +1,20 @@
+[Unit]
+Description=PawLuxe Export Job Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__PAWLUXE_USER__
+Group=__PAWLUXE_USER__
+WorkingDirectory=__PAWLUXE_ROOT__
+EnvironmentFile=__PAWLUXE_ROOT__/.env
+ExecStart=__PAWLUXE_ROOT__/.venv/bin/python -m app.workers.export_job_worker --poll-seconds 1.5
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

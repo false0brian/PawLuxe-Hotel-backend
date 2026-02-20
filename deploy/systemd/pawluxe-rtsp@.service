@@ -1,0 +1,22 @@
+[Unit]
+Description=PawLuxe RTSP Tracking Worker (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__PAWLUXE_USER__
+Group=__PAWLUXE_USER__
+WorkingDirectory=__PAWLUXE_ROOT__
+EnvironmentFile=__PAWLUXE_ROOT__/.env
+EnvironmentFile=__PAWLUXE_ROOT__/deploy/systemd/rtsp-worker-common.env
+EnvironmentFile=__PAWLUXE_ROOT__/deploy/systemd/rtsp-worker-%i.env
+ExecStart=__PAWLUXE_ROOT__/.venv/bin/python -m app.workers.run_rtsp_worker_from_env
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
