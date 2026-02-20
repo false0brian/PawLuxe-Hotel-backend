@@ -1519,6 +1519,7 @@ def get_booking_report(
     clip_items: list[dict[str, Any]] = []
     if events:
         event_ids = [row.event_id for row in events]
+        event_type_by_id = {row.event_id: row.type for row in events}
         clips = list(
             session.exec(
                 select(Clip)
@@ -1530,6 +1531,7 @@ def get_booking_report(
             {
                 "clip_id": row.clip_id,
                 "event_id": row.event_id,
+                "event_type": event_type_by_id.get(row.event_id or "", "unknown"),
                 "path": row.path,
                 "start_ts": row.start_ts,
                 "end_ts": row.end_ts,

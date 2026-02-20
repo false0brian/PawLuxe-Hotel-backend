@@ -293,6 +293,7 @@ def test_owner_dashboard_and_booking_report() -> None:
     report = report_resp.json()
     assert report["summary"]["care_log_count"] >= 1
     assert report["summary"]["clip_count"] >= 1
+    assert report["clips"][0]["event_type"] == "check"
 
 
 def test_camera_playback_url_endpoint() -> None:
