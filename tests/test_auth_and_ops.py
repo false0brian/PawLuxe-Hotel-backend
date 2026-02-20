@@ -554,3 +554,28 @@ def test_system_ingest_and_alert_evaluate_flow() -> None:
     assert alerts_resp.status_code == 200
     alerts = alerts_resp.json()
     assert any(row["camera_id"] == cam_id for row in alerts)
+
+
+def test_staff_alerts_websocket_stream() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": f"S1-ROOM-{suffix}"},
+        headers=_headers("admin", "admin-1"),
+    )
+    cam_id = cam_resp.json()["camera_id"]
+    health_resp = client.post(
+        "/api/v1/system/camera-health",
+        json={"camera_id": cam_id, "status": "down", "reconnect_count": 1},
+        headers=_headers("system"),
+    )
+    assert health_resp.status_code == 200
+    eval_resp = client.post("/api/v1/system/alerts/evaluate", headers=_headers("system"))
+    assert eval_resp.status_code == 200
+
+    with client.websocket_connect(
+        f"/api/v1/ws/staff-alerts?api_key=change-me&role=staff&user_id=staff-1&interval_ms=500"
+    ) as ws:
+        payload = ws.receive_json()
+        assert payload["type"] == "staff_alerts"
+        assert isinstance(payload["alerts"], list)

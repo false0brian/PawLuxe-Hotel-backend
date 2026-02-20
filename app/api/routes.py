@@ -259,6 +259,136 @@ def _ensure_staff_alert(
     return row
 
 
+def _serialize_staff_alert(row: StaffAlert) -> dict[str, Any]:
+    details = None
+    if row.details_json:
+        try:
+            parsed = json.loads(row.details_json)
+            details = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            details = None
+    return {
+        "alert_id": row.alert_id,
+        "at": row.at.isoformat() if row.at else None,
+        "type": row.type,
+        "severity": row.severity,
+        "status": row.status,
+        "message": row.message,
+        "zone_id": row.zone_id,
+        "camera_id": row.camera_id,
+        "pet_id": row.pet_id,
+        "booking_id": row.booking_id,
+        "details": details,
+        "acked_by": row.acked_by,
+        "acked_at": row.acked_at.isoformat() if row.acked_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _evaluate_staff_alert_rules(
+    session: Session,
+    *,
+    stale_seconds: int,
+    isolation_minutes: int,
+    idle_seconds: int,
+) -> int:
+    now = utcnow()
+    created = 0
+
+    # Rule 1: camera health degraded/down/stale
+    health_rows = list(session.exec(select(CameraHealth)))
+    for row in health_rows:
+        is_stale = True
+        if row.last_frame_at:
+            is_stale = (now - _to_utc(row.last_frame_at)).total_seconds() > stale_seconds
+        if row.status in {"down", "degraded"} or is_stale:
+            sev = "critical" if row.status == "down" else "warning"
+            detail = {"status": row.status, "is_stale": is_stale, "last_frame_at": row.last_frame_at}
+            _ensure_staff_alert(
+                session,
+                type="camera_health",
+                severity=sev,
+                message=f"카메라 상태 이상: {row.camera_id} ({row.status}{', stale' if is_stale else ''})",
+                camera_id=row.camera_id,
+                details=detail,
+                dedupe_seconds=120,
+            )
+            created += 1
+
+    # Rule 2: recent move to isolation
+    isolation_since = now - timedelta(minutes=isolation_minutes)
+    iso_rows = list(
+        session.exec(
+            select(PetZoneEvent)
+            .where(PetZoneEvent.at >= isolation_since)
+            .where(PetZoneEvent.to_zone_id.contains("ISOLATION"))
+            .order_by(PetZoneEvent.at.desc())
+            .limit(100)
+        )
+    )
+    for row in iso_rows:
+        _ensure_staff_alert(
+            session,
+            type="isolation_move",
+            severity="warning",
+            message=f"격리 이동 감지: pet={row.pet_id}, zone={row.to_zone_id}",
+            zone_id=row.to_zone_id,
+            pet_id=row.pet_id,
+            details={"from_zone_id": row.from_zone_id, "by_staff_id": row.by_staff_id, "at": row.at.isoformat()},
+            dedupe_seconds=300,
+        )
+        created += 1
+
+    # Rule 3: active booking pet has no recent track observation
+    bookings = list(
+        session.exec(
+            select(Booking)
+            .where(Booking.status.in_(["reserved", "checked_in"]))
+            .where(Booking.start_at <= now)
+            .where(Booking.end_at >= now)
+            .limit(500)
+        )
+    )
+    for booking in bookings:
+        assoc_rows = list(
+            session.exec(
+                select(Association)
+                .where(Association.animal_id == booking.pet_id)
+                .order_by(Association.created_at.desc())
+                .limit(20)
+            )
+        )
+        latest_obs_ts: datetime | None = None
+        for assoc in assoc_rows:
+            obs = session.exec(
+                select(TrackObservation)
+                .where(TrackObservation.track_id == assoc.track_id)
+                .order_by(TrackObservation.ts.desc())
+                .limit(1)
+            ).first()
+            if obs and (latest_obs_ts is None or obs.ts > latest_obs_ts):
+                latest_obs_ts = obs.ts
+
+        if latest_obs_ts is None or (now - _to_utc(latest_obs_ts)).total_seconds() > idle_seconds:
+            latest_zone = session.exec(
+                select(PetZoneEvent).where(PetZoneEvent.pet_id == booking.pet_id).order_by(PetZoneEvent.at.desc()).limit(1)
+            ).first()
+            zone_id = latest_zone.to_zone_id if latest_zone else booking.room_zone_id
+            _ensure_staff_alert(
+                session,
+                type="animal_idle",
+                severity="warning",
+                message=f"트래킹 공백 감지: pet={booking.pet_id}, zone={zone_id}",
+                zone_id=zone_id,
+                pet_id=booking.pet_id,
+                booking_id=booking.booking_id,
+                details={"last_observation_ts": latest_obs_ts.isoformat() if latest_obs_ts else None},
+                dedupe_seconds=180,
+            )
+            created += 1
+    return created
+
+
 def _parse_bbox_xyxy(raw: str) -> list[float] | None:
     try:
         parsed = json.loads(raw)
@@ -931,6 +1061,66 @@ async def ws_live_tracks(websocket: WebSocket) -> None:
         return
 
 
+@router.websocket("/ws/staff-alerts")
+async def ws_staff_alerts(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        api_key = websocket.query_params.get("api_key", "")
+        role = (websocket.query_params.get("role", "staff") or "staff").lower()
+        user_id = websocket.query_params.get("user_id", "")
+        status = (websocket.query_params.get("status", "open") or "open").strip()
+        limit_raw = websocket.query_params.get("limit", "100")
+        interval_ms_raw = websocket.query_params.get("interval_ms", "1500")
+        auto_eval = (websocket.query_params.get("auto_eval", "false") or "false").lower() == "true"
+
+        if api_key != settings.api_key:
+            await websocket.send_json({"error": "invalid_api_key"})
+            await websocket.close(code=1008)
+            return
+        if role not in {"staff", "admin", "system"}:
+            await websocket.send_json({"error": "role_must_be_staff_admin_system"})
+            await websocket.close(code=1008)
+            return
+        if role != "system" and not user_id.strip():
+            await websocket.send_json({"error": "user_id_required"})
+            await websocket.close(code=1008)
+            return
+
+        try:
+            limit = max(1, min(500, int(limit_raw)))
+        except ValueError:
+            limit = 100
+        try:
+            interval_ms = max(300, min(10000, int(interval_ms_raw)))
+        except ValueError:
+            interval_ms = 1500
+
+        last_signature = ""
+        while True:
+            with Session(engine) as session:
+                if auto_eval and role in {"admin", "system"}:
+                    _evaluate_staff_alert_rules(
+                        session,
+                        stale_seconds=15,
+                        isolation_minutes=15,
+                        idle_seconds=180,
+                    )
+                query = select(StaffAlert)
+                if status:
+                    query = query.where(StaffAlert.status == status)
+                query = query.order_by(StaffAlert.updated_at.desc()).limit(limit)
+                rows = list(session.exec(query))
+                alerts = [_serialize_staff_alert(row) for row in rows]
+
+            signature = "|".join(f"{it['alert_id']}:{it['updated_at']}:{it['status']}" for it in alerts)
+            if signature != last_signature:
+                last_signature = signature
+                await websocket.send_json({"type": "staff_alerts", "count": len(alerts), "alerts": alerts})
+            await asyncio.sleep(interval_ms / 1000.0)
+    except WebSocketDisconnect:
+        return
+
+
 @router.post("/system/live-tracks/ingest")
 def ingest_live_tracks(
     payload: LiveTrackIngestRequest,
@@ -1045,101 +1235,12 @@ def evaluate_staff_alerts(
     _: AuthContext = Depends(require_admin_or_system),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    now = utcnow()
-    created = 0
-
-    # Rule 1: camera health degraded/down/stale
-    health_rows = list(session.exec(select(CameraHealth)))
-    for row in health_rows:
-        is_stale = True
-        if row.last_frame_at:
-            is_stale = (now - _to_utc(row.last_frame_at)).total_seconds() > stale_seconds
-        if row.status in {"down", "degraded"} or is_stale:
-            sev = "critical" if row.status == "down" else "warning"
-            detail = {"status": row.status, "is_stale": is_stale, "last_frame_at": row.last_frame_at}
-            _ensure_staff_alert(
-                session,
-                type="camera_health",
-                severity=sev,
-                message=f"카메라 상태 이상: {row.camera_id} ({row.status}{', stale' if is_stale else ''})",
-                camera_id=row.camera_id,
-                details=detail,
-                dedupe_seconds=120,
-            )
-            created += 1
-
-    # Rule 2: recent move to isolation
-    isolation_since = now - timedelta(minutes=isolation_minutes)
-    iso_rows = list(
-        session.exec(
-            select(PetZoneEvent)
-            .where(PetZoneEvent.at >= isolation_since)
-            .where(PetZoneEvent.to_zone_id.contains("ISOLATION"))
-            .order_by(PetZoneEvent.at.desc())
-            .limit(100)
-        )
+    created = _evaluate_staff_alert_rules(
+        session,
+        stale_seconds=stale_seconds,
+        isolation_minutes=isolation_minutes,
+        idle_seconds=idle_seconds,
     )
-    for row in iso_rows:
-        _ensure_staff_alert(
-            session,
-            type="isolation_move",
-            severity="warning",
-            message=f"격리 이동 감지: pet={row.pet_id}, zone={row.to_zone_id}",
-            zone_id=row.to_zone_id,
-            pet_id=row.pet_id,
-            details={"from_zone_id": row.from_zone_id, "by_staff_id": row.by_staff_id, "at": row.at.isoformat()},
-            dedupe_seconds=300,
-        )
-        created += 1
-
-    # Rule 3: active booking pet has no recent track observation
-    bookings = list(
-        session.exec(
-            select(Booking)
-            .where(Booking.status.in_(["reserved", "checked_in"]))
-            .where(Booking.start_at <= now)
-            .where(Booking.end_at >= now)
-            .limit(500)
-        )
-    )
-    for booking in bookings:
-        assoc_rows = list(
-            session.exec(
-                select(Association)
-                .where(Association.animal_id == booking.pet_id)
-                .order_by(Association.created_at.desc())
-                .limit(20)
-            )
-        )
-        latest_obs_ts: datetime | None = None
-        for assoc in assoc_rows:
-            obs = session.exec(
-                select(TrackObservation)
-                .where(TrackObservation.track_id == assoc.track_id)
-                .order_by(TrackObservation.ts.desc())
-                .limit(1)
-            ).first()
-            if obs and (latest_obs_ts is None or obs.ts > latest_obs_ts):
-                latest_obs_ts = obs.ts
-
-        if latest_obs_ts is None or (now - _to_utc(latest_obs_ts)).total_seconds() > idle_seconds:
-            latest_zone = session.exec(
-                select(PetZoneEvent).where(PetZoneEvent.pet_id == booking.pet_id).order_by(PetZoneEvent.at.desc()).limit(1)
-            ).first()
-            zone_id = latest_zone.to_zone_id if latest_zone else booking.room_zone_id
-            _ensure_staff_alert(
-                session,
-                type="animal_idle",
-                severity="warning",
-                message=f"트래킹 공백 감지: pet={booking.pet_id}, zone={zone_id}",
-                zone_id=zone_id,
-                pet_id=booking.pet_id,
-                booking_id=booking.booking_id,
-                details={"last_observation_ts": latest_obs_ts.isoformat() if latest_obs_ts else None},
-                dedupe_seconds=180,
-            )
-            created += 1
-
     return {"ok": True, "created_or_touched": created}
 
 
@@ -1149,12 +1250,13 @@ def list_staff_alerts(
     limit: int = Query(default=100, ge=1, le=500),
     _: AuthContext = Depends(require_staff_or_admin),
     session: Session = Depends(get_session),
-) -> list[StaffAlert]:
+) -> list[dict[str, Any]]:
     query = select(StaffAlert)
     if status:
         query = query.where(StaffAlert.status == status)
     query = query.order_by(StaffAlert.updated_at.desc()).limit(limit)
-    return list(session.exec(query))
+    rows = list(session.exec(query))
+    return [_serialize_staff_alert(row) for row in rows]
 
 
 @router.post("/staff/alerts/{alert_id}/ack")

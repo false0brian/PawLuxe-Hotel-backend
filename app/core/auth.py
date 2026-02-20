@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import hashlib
 from typing import Literal
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Query
 from sqlmodel import Session, select
 
 from app.core.config import settings
@@ -24,8 +24,8 @@ def _verify_api_key(x_api_key: str) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def verify_api_key(x_api_key: str = Header(default="")) -> None:
-    _verify_api_key(x_api_key)
+def verify_api_key(x_api_key: str = Header(default=""), api_key: str = Query(default="")) -> None:
+    _verify_api_key(x_api_key or api_key)
 
 
 def hash_session_token(token: str) -> str:

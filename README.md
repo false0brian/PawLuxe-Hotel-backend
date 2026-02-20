@@ -69,6 +69,7 @@ API_KEY=change-me \
 - `POST /api/v1/system/alerts/evaluate`: 카메라/격리이동/트래킹공백 규칙 평가
 - `GET /api/v1/staff/alerts`: 스태프 알림 목록 조회
 - `POST /api/v1/staff/alerts/{alert_id}/ack`: 알림 ack/resolved 처리
+- `WS /api/v1/ws/staff-alerts`: 스태프 알림 실시간 스트림
 
 ## 스트림 보안
 - `POST /api/v1/auth/stream-verify`는 `viewer_session_id` 기반 동시 세션 제한을 강제합니다.
