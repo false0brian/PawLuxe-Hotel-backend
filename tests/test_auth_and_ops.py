@@ -207,6 +207,12 @@ def test_staff_today_board_returns_active_items() -> None:
     assert matched
     assert matched[0]["next_action"] == "potty_check"
 
+    feed_resp = client.get("/api/v1/staff/activity-feed?limit=20", headers=_headers("staff", "staff-1"))
+    assert feed_resp.status_code == 200
+    feed = feed_resp.json()
+    assert feed["count"] >= 1
+    assert any(it["kind"] == "care_log" for it in feed["items"])
+
 
 def test_owner_dashboard_and_booking_report() -> None:
     suffix = str(uuid.uuid4())[:8]

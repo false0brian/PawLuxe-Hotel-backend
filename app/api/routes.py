@@ -821,6 +821,62 @@ def get_staff_today_board(
     }
 
 
+@router.get("/staff/activity-feed")
+def get_staff_activity_feed(
+    limit: int = Query(default=30, ge=1, le=200),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    logs = list(session.exec(select(CareLog).order_by(CareLog.at.desc()).limit(limit)))
+    moves = list(session.exec(select(PetZoneEvent).order_by(PetZoneEvent.at.desc()).limit(limit)))
+    alerts = list(session.exec(select(StaffAlert).order_by(StaffAlert.updated_at.desc()).limit(limit)))
+
+    items: list[dict[str, Any]] = []
+    for row in logs:
+        items.append(
+            {
+                "kind": "care_log",
+                "ts": row.at,
+                "summary": f"{row.type} | pet={row.pet_id} | {row.value}",
+                "staff_id": row.staff_id,
+                "pet_id": row.pet_id,
+                "booking_id": row.booking_id,
+            }
+        )
+    for row in moves:
+        items.append(
+            {
+                "kind": "zone_move",
+                "ts": row.at,
+                "summary": f"pet={row.pet_id} {row.from_zone_id or '-'} -> {row.to_zone_id}",
+                "staff_id": row.by_staff_id,
+                "pet_id": row.pet_id,
+                "to_zone_id": row.to_zone_id,
+            }
+        )
+    for row in alerts:
+        items.append(
+            {
+                "kind": "alert",
+                "ts": row.updated_at,
+                "summary": f"{row.type} | status={row.status} | {row.message}",
+                "staff_id": row.acked_by,
+                "pet_id": row.pet_id,
+                "camera_id": row.camera_id,
+                "zone_id": row.zone_id,
+            }
+        )
+
+    items.sort(key=lambda it: _to_utc(it["ts"]), reverse=True)
+    feed = items[:limit]
+    return {
+        "at": now,
+        "count": len(feed),
+        "items": feed,
+    }
+
+
 @router.post("/staff/logs")
 def create_care_log(
     payload: CareLogCreate,
