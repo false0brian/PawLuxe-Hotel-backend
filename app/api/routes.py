@@ -1051,6 +1051,88 @@ def get_live_zones_heatmap(
     }
 
 
+@router.get("/live/zones/risk")
+def get_live_zones_risk(
+    window_seconds: int = Query(default=60, ge=10, le=3600),
+    stale_seconds: int = Query(default=15, ge=5, le=600),
+    _: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    now = utcnow()
+    tracks = _collect_live_tracks(
+        session=session,
+        camera_id=None,
+        animal_id=None,
+        since_ts=now - timedelta(seconds=window_seconds),
+        limit=5000,
+    )
+    observation_counts: dict[str, int] = {}
+    for row in tracks:
+        zone_id = row["zone_id"] or "UNKNOWN"
+        observation_counts[zone_id] = observation_counts.get(zone_id, 0) + 1
+
+    camera_zone: dict[str, str] = {}
+    cameras = list(session.exec(select(Camera)))
+    for cam in cameras:
+        camera_zone[cam.camera_id] = cam.location_zone
+
+    open_alerts = list(session.exec(select(StaffAlert).where(StaffAlert.status == "open")))
+    open_counts: dict[str, int] = {}
+    critical_counts: dict[str, int] = {}
+    reasons: dict[str, dict[str, int]] = {}
+    for row in open_alerts:
+        zone_id = row.zone_id or (camera_zone.get(row.camera_id or "", "") or "UNKNOWN")
+        open_counts[zone_id] = open_counts.get(zone_id, 0) + 1
+        if row.severity == "critical":
+            critical_counts[zone_id] = critical_counts.get(zone_id, 0) + 1
+        zone_reasons = reasons.get(zone_id)
+        if zone_reasons is None:
+            zone_reasons = {}
+            reasons[zone_id] = zone_reasons
+        zone_reasons[row.type] = zone_reasons.get(row.type, 0) + 1
+
+    stale_camera_counts: dict[str, int] = {}
+    health_rows = list(session.exec(select(CameraHealth)))
+    for row in health_rows:
+        zone_id = camera_zone.get(row.camera_id, "UNKNOWN")
+        is_stale = True
+        if row.last_frame_at:
+            is_stale = (now - _to_utc(row.last_frame_at)).total_seconds() > stale_seconds
+        if row.status in {"down", "degraded"} or is_stale:
+            stale_camera_counts[zone_id] = stale_camera_counts.get(zone_id, 0) + 1
+
+    zone_ids = set(observation_counts) | set(open_counts) | set(stale_camera_counts)
+    zones: list[dict[str, Any]] = []
+    for zone_id in zone_ids:
+        obs = observation_counts.get(zone_id, 0)
+        open_cnt = open_counts.get(zone_id, 0)
+        critical_cnt = critical_counts.get(zone_id, 0)
+        stale_cam_cnt = stale_camera_counts.get(zone_id, 0)
+        activity_score = min(obs, 40) * 0.5
+        risk_score = min(100.0, (critical_cnt * 45.0) + (open_cnt * 12.0) + (stale_cam_cnt * 18.0) + activity_score)
+        zone_reasons = reasons.get(zone_id, {})
+        top_reasons = sorted(zone_reasons, key=lambda k: zone_reasons[k], reverse=True)[:3]
+        zones.append(
+            {
+                "zone_id": zone_id,
+                "risk_score": round(risk_score, 2),
+                "observation_count": obs,
+                "open_alert_count": open_cnt,
+                "critical_alert_count": critical_cnt,
+                "stale_camera_count": stale_cam_cnt,
+                "top_reasons": top_reasons,
+            }
+        )
+    zones.sort(key=lambda it: (-it["risk_score"], it["zone_id"]))
+    return {
+        "at": now,
+        "window_seconds": window_seconds,
+        "stale_seconds": stale_seconds,
+        "zone_count": len(zones),
+        "zones": zones,
+    }
+
+
 @router.get("/live/cameras/{camera_id}/playback-url")
 def get_camera_playback_url(
     camera_id: str,

@@ -446,6 +446,36 @@ def test_live_zone_heatmap_endpoint() -> None:
     assert zones[0]["total_observations"] >= 4
 
 
+def test_live_zone_risk_endpoint() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    zone = f"S1-ROOM-{suffix}"
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": zone},
+        headers=_headers("admin", "admin-1"),
+    )
+    assert cam_resp.status_code == 200
+    cam_id = cam_resp.json()["camera_id"]
+
+    health_resp = client.post(
+        "/api/v1/system/camera-health",
+        json={"camera_id": cam_id, "status": "down", "reconnect_count": 1},
+        headers=_headers("system"),
+    )
+    assert health_resp.status_code == 200
+    eval_resp = client.post("/api/v1/system/alerts/evaluate", headers=_headers("system"))
+    assert eval_resp.status_code == 200
+
+    risk_resp = client.get("/api/v1/live/zones/risk?window_seconds=120", headers=_headers("staff", "staff-1"))
+    assert risk_resp.status_code == 200
+    body = risk_resp.json()
+    assert body["zone_count"] >= 1
+    rows = [z for z in body["zones"] if z["zone_id"] == zone]
+    assert rows
+    assert rows[0]["risk_score"] >= 1.0
+    assert rows[0]["open_alert_count"] >= 1
+
+
 def test_stream_verify_enforces_session_limit() -> None:
     suffix = str(uuid.uuid4())[:8]
     owner_id = f"owner-{suffix}"

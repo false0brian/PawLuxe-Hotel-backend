@@ -61,6 +61,7 @@ API_KEY=change-me \
 - `GET /api/v1/live/tracks/latest`: 최신 트랙(bbox/zone/animal) 조회
 - `GET /api/v1/live/zones/summary`: 존 단위 실시간 관측 집계
 - `GET /api/v1/live/zones/heatmap`: 존 단위 시간 버킷 히트맵 집계
+- `GET /api/v1/live/zones/risk`: 존 단위 리스크 점수(open/critical/stale) 집계
 - `WS /api/v1/ws/live-tracks`: 실시간 트랙 스트림
 - `GET /api/v1/live/cameras/{camera_id}/playback-url`: 프론트 오버레이용 재생 URL 조회
 - `POST /api/v1/system/live-tracks/ingest`: 외부 추적기 입력을 실시간 적재
