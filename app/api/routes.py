@@ -268,6 +268,21 @@ def _serialize_staff_alert(row: StaffAlert) -> dict[str, Any]:
             details = parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             details = None
+    recommended_actions: list[dict[str, str]] = []
+    if row.type == "camera_health":
+        recommended_actions = [
+            {"action_id": "mark_camera_check_requested", "label": "카메라 점검 요청"},
+            {"action_id": "resolve_if_recovered", "label": "복구 시 종료"},
+        ]
+    elif row.type == "isolation_move":
+        recommended_actions = [
+            {"action_id": "open_isolation_checklist", "label": "격리 체크리스트"},
+        ]
+    elif row.type == "animal_idle":
+        recommended_actions = [
+            {"action_id": "request_live_recheck", "label": "라이브 재확인 요청"},
+        ]
+
     return {
         "alert_id": row.alert_id,
         "at": row.at.isoformat() if row.at else None,
@@ -283,6 +298,7 @@ def _serialize_staff_alert(row: StaffAlert) -> dict[str, Any]:
         "acked_by": row.acked_by,
         "acked_at": row.acked_at.isoformat() if row.acked_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "recommended_actions": recommended_actions,
     }
 
 
@@ -1526,6 +1542,100 @@ def ack_staff_alert(
     session.commit()
     session.refresh(row)
     return row
+
+
+@router.post("/staff/alerts/{alert_id}/actions/{action_id}")
+def execute_staff_alert_action(
+    alert_id: str,
+    action_id: str,
+    auth: AuthContext = Depends(require_staff_or_admin),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    row = session.get(StaffAlert, alert_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    now = utcnow()
+    side_effect: dict[str, Any] = {"action_id": action_id}
+
+    if action_id == "mark_camera_check_requested" and row.type == "camera_health":
+        row.status = "acked"
+        row.acked_by = auth.user_id or row.acked_by
+        row.acked_at = now
+        row.updated_at = now
+        side_effect["result"] = "camera_check_requested"
+
+    elif action_id == "resolve_if_recovered" and row.type == "camera_health":
+        if not row.camera_id:
+            raise HTTPException(status_code=400, detail="camera_id missing on alert")
+        health = session.get(CameraHealth, row.camera_id)
+        recovered = False
+        if health and health.status == "healthy" and health.last_frame_at:
+            recovered = (now - _to_utc(health.last_frame_at)).total_seconds() <= 20
+        if not recovered:
+            raise HTTPException(status_code=409, detail="Camera is not recovered yet")
+        row.status = "resolved"
+        row.acked_by = auth.user_id or row.acked_by
+        row.acked_at = now
+        row.updated_at = now
+        side_effect["result"] = "resolved_recovered"
+
+    elif action_id == "open_isolation_checklist" and row.type == "isolation_move":
+        if not row.pet_id:
+            raise HTTPException(status_code=400, detail="pet_id missing on alert")
+        booking = session.exec(
+            select(Booking)
+            .where(Booking.pet_id == row.pet_id)
+            .where(Booking.start_at <= now)
+            .where(Booking.end_at >= now)
+            .where(Booking.status.in_(["reserved", "checked_in"]))
+            .order_by(Booking.start_at.desc())
+            .limit(1)
+        ).first()
+        if booking:
+            log = CareLog(
+                pet_id=row.pet_id,
+                booking_id=booking.booking_id,
+                type="note",
+                at=now,
+                value="isolation checklist requested",
+                staff_id=auth.user_id or "staff",
+            )
+            session.add(log)
+            side_effect["care_log_id"] = log.log_id
+        row.status = "acked"
+        row.acked_by = auth.user_id or row.acked_by
+        row.acked_at = now
+        row.updated_at = now
+        side_effect["result"] = "checklist_requested"
+
+    elif action_id == "request_live_recheck" and row.type == "animal_idle":
+        if not row.pet_id:
+            raise HTTPException(status_code=400, detail="pet_id missing on alert")
+        event = Event(
+            animal_id=row.pet_id,
+            type="idle_recheck_requested",
+            severity="info",
+            start_ts=now,
+        )
+        session.add(event)
+        row.status = "acked"
+        row.acked_by = auth.user_id or row.acked_by
+        row.acked_at = now
+        row.updated_at = now
+        side_effect["event_id"] = event.event_id
+        side_effect["result"] = "recheck_requested"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported action for this alert")
+
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return {
+        "ok": True,
+        "alert": _serialize_staff_alert(row),
+        "side_effect": side_effect,
+    }
 
 
 @router.get("/owner/dashboard")

@@ -701,3 +701,39 @@ def test_staff_alerts_websocket_stream() -> None:
         payload = ws.receive_json()
         assert payload["type"] == "staff_alerts"
         assert isinstance(payload["alerts"], list)
+
+
+def test_staff_alert_action_execute() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+    pet_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "dog", "name": f"Leo-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    pet_id = pet_resp.json()["animal_id"]
+    cam_resp = client.post(
+        "/api/v1/cameras",
+        json={"location_zone": f"S1-ROOM-{suffix}"},
+        headers=_headers("admin", "admin-1"),
+    )
+    cam_id = cam_resp.json()["camera_id"]
+    client.post(
+        "/api/v1/system/camera-health",
+        json={"camera_id": cam_id, "status": "down"},
+        headers=_headers("system"),
+    )
+    client.post("/api/v1/system/alerts/evaluate", headers=_headers("system"))
+    alerts_resp = client.get("/api/v1/staff/alerts?status=open&limit=50", headers=_headers("staff", "staff-1"))
+    camera_alerts = [a for a in alerts_resp.json() if a.get("camera_id") == cam_id and a.get("type") == "camera_health"]
+    assert camera_alerts
+    alert_id = camera_alerts[0]["alert_id"]
+
+    action_resp = client.post(
+        f"/api/v1/staff/alerts/{alert_id}/actions/mark_camera_check_requested",
+        headers=_headers("staff", "staff-1"),
+    )
+    assert action_resp.status_code == 200
+    body = action_resp.json()
+    assert body["ok"] is True
+    assert body["alert"]["status"] == "acked"

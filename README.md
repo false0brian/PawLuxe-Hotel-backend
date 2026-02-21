@@ -70,6 +70,7 @@ API_KEY=change-me \
 - `POST /api/v1/system/alerts/evaluate`: 카메라/격리이동/트래킹공백 규칙 평가
 - `GET /api/v1/staff/alerts`: 스태프 알림 목록 조회
 - `POST /api/v1/staff/alerts/{alert_id}/ack`: 알림 ack/resolved 처리
+- `POST /api/v1/staff/alerts/{alert_id}/actions/{action_id}`: 추천 액션 실행
 - `WS /api/v1/ws/staff-alerts`: 스태프 알림 실시간 스트림
 - `GET /api/v1/staff/today-board`의 `alerts_summary`로 운영 KPI(open/critical/avg_ack) 확인
 
