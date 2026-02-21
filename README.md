@@ -74,6 +74,7 @@ API_KEY=change-me \
 - `WS /api/v1/ws/staff-alerts`: 스태프 알림 실시간 스트림
 - `GET /api/v1/staff/today-board`의 `alerts_summary`로 운영 KPI(open/critical/avg_ack) 확인
 - `GET /api/v1/staff/activity-feed`: 최근 운영 액션(알림/이동/케어로그) 통합 피드
+- `WS /api/v1/ws/staff-activity-feed`: 운영 액션 피드 실시간 스트림
 
 ## 자동 클립 API
 - `POST /api/v1/system/clips/auto-generate`: 최근 트랙 관측 기반 auto_highlight 이벤트/클립 생성

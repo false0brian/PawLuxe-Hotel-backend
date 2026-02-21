@@ -709,6 +709,50 @@ def test_staff_alerts_websocket_stream() -> None:
         assert isinstance(payload["alerts"], list)
 
 
+def test_staff_activity_feed_websocket_stream() -> None:
+    suffix = str(uuid.uuid4())[:8]
+    owner_id = f"owner-{suffix}"
+    animal_resp = client.post(
+        "/api/v1/animals",
+        json={"species": "dog", "name": f"Milo-{suffix}", "owner_id": owner_id},
+        headers=_headers("admin", "admin-1"),
+    )
+    pet_id = animal_resp.json()["animal_id"]
+    booking_resp = client.post(
+        "/api/v1/bookings",
+        json={
+            "owner_id": owner_id,
+            "pet_id": pet_id,
+            "start_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(),
+            "end_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            "room_zone_id": f"S1-ROOM-{suffix}",
+            "status": "checked_in",
+        },
+        headers=_headers("admin", "admin-1"),
+    )
+    booking_id = booking_resp.json()["booking_id"]
+    log_resp = client.post(
+        "/api/v1/staff/logs",
+        json={
+            "pet_id": pet_id,
+            "booking_id": booking_id,
+            "type": "note",
+            "value": "ws-feed-test",
+            "staff_id": "staff-1",
+        },
+        headers=_headers("staff", "staff-1"),
+    )
+    assert log_resp.status_code == 200
+
+    with client.websocket_connect(
+        "/api/v1/ws/staff-activity-feed?api_key=change-me&role=staff&user_id=staff-1&interval_ms=500&limit=20"
+    ) as ws:
+        payload = ws.receive_json()
+        assert payload["type"] == "staff_activity_feed"
+        assert isinstance(payload["items"], list)
+        assert any("ws-feed-test" in (it.get("summary") or "") for it in payload["items"])
+
+
 def test_staff_alert_action_execute() -> None:
     suffix = str(uuid.uuid4())[:8]
     owner_id = f"owner-{suffix}"

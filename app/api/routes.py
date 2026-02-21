@@ -406,6 +406,56 @@ def _evaluate_staff_alert_rules(
     return created
 
 
+def _build_staff_activity_feed(session: Session, *, limit: int) -> list[dict[str, Any]]:
+    logs = list(session.exec(select(CareLog).order_by(CareLog.at.desc()).limit(limit)))
+    moves = list(session.exec(select(PetZoneEvent).order_by(PetZoneEvent.at.desc()).limit(limit)))
+    alerts = list(session.exec(select(StaffAlert).order_by(StaffAlert.updated_at.desc()).limit(limit)))
+
+    items: list[dict[str, Any]] = []
+    for row in logs:
+        items.append(
+            {
+                "kind": "care_log",
+                "ts": row.at,
+                "summary": f"{row.type} | pet={row.pet_id} | {row.value}",
+                "staff_id": row.staff_id,
+                "pet_id": row.pet_id,
+                "booking_id": row.booking_id,
+            }
+        )
+    for row in moves:
+        items.append(
+            {
+                "kind": "zone_move",
+                "ts": row.at,
+                "summary": f"pet={row.pet_id} {row.from_zone_id or '-'} -> {row.to_zone_id}",
+                "staff_id": row.by_staff_id,
+                "pet_id": row.pet_id,
+                "to_zone_id": row.to_zone_id,
+            }
+        )
+    for row in alerts:
+        items.append(
+            {
+                "kind": "alert",
+                "ts": row.updated_at,
+                "summary": f"{row.type} | status={row.status} | {row.message}",
+                "staff_id": row.acked_by,
+                "pet_id": row.pet_id,
+                "camera_id": row.camera_id,
+                "zone_id": row.zone_id,
+            }
+        )
+    items.sort(key=lambda it: _to_utc(it["ts"]), reverse=True)
+    out: list[dict[str, Any]] = []
+    for item in items[:limit]:
+        row = dict(item)
+        ts = row.get("ts")
+        row["ts"] = ts.isoformat() if isinstance(ts, datetime) else ts
+        out.append(row)
+    return out
+
+
 def _find_segment_for_camera_ts(
     session: Session,
     *,
@@ -828,48 +878,7 @@ def get_staff_activity_feed(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     now = utcnow()
-    logs = list(session.exec(select(CareLog).order_by(CareLog.at.desc()).limit(limit)))
-    moves = list(session.exec(select(PetZoneEvent).order_by(PetZoneEvent.at.desc()).limit(limit)))
-    alerts = list(session.exec(select(StaffAlert).order_by(StaffAlert.updated_at.desc()).limit(limit)))
-
-    items: list[dict[str, Any]] = []
-    for row in logs:
-        items.append(
-            {
-                "kind": "care_log",
-                "ts": row.at,
-                "summary": f"{row.type} | pet={row.pet_id} | {row.value}",
-                "staff_id": row.staff_id,
-                "pet_id": row.pet_id,
-                "booking_id": row.booking_id,
-            }
-        )
-    for row in moves:
-        items.append(
-            {
-                "kind": "zone_move",
-                "ts": row.at,
-                "summary": f"pet={row.pet_id} {row.from_zone_id or '-'} -> {row.to_zone_id}",
-                "staff_id": row.by_staff_id,
-                "pet_id": row.pet_id,
-                "to_zone_id": row.to_zone_id,
-            }
-        )
-    for row in alerts:
-        items.append(
-            {
-                "kind": "alert",
-                "ts": row.updated_at,
-                "summary": f"{row.type} | status={row.status} | {row.message}",
-                "staff_id": row.acked_by,
-                "pet_id": row.pet_id,
-                "camera_id": row.camera_id,
-                "zone_id": row.zone_id,
-            }
-        )
-
-    items.sort(key=lambda it: _to_utc(it["ts"]), reverse=True)
-    feed = items[:limit]
+    feed = _build_staff_activity_feed(session, limit=limit)
     return {
         "at": now,
         "count": len(feed),
@@ -1329,6 +1338,49 @@ async def ws_staff_alerts(websocket: WebSocket) -> None:
             if signature != last_signature:
                 last_signature = signature
                 await websocket.send_json({"type": "staff_alerts", "count": len(alerts), "alerts": alerts})
+            await asyncio.sleep(interval_ms / 1000.0)
+    except WebSocketDisconnect:
+        return
+
+
+@router.websocket("/ws/staff-activity-feed")
+async def ws_staff_activity_feed(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        api_key = websocket.query_params.get("api_key", "")
+        role = (websocket.query_params.get("role", "staff") or "staff").lower()
+        user_id = websocket.query_params.get("user_id", "")
+        limit_raw = websocket.query_params.get("limit", "30")
+        interval_ms_raw = websocket.query_params.get("interval_ms", "1500")
+        if api_key != settings.api_key:
+            await websocket.send_json({"error": "invalid_api_key"})
+            await websocket.close(code=1008)
+            return
+        if role not in {"staff", "admin", "system"}:
+            await websocket.send_json({"error": "role_must_be_staff_admin_system"})
+            await websocket.close(code=1008)
+            return
+        if role != "system" and not user_id.strip():
+            await websocket.send_json({"error": "user_id_required"})
+            await websocket.close(code=1008)
+            return
+        try:
+            limit = max(1, min(200, int(limit_raw)))
+        except ValueError:
+            limit = 30
+        try:
+            interval_ms = max(300, min(10000, int(interval_ms_raw)))
+        except ValueError:
+            interval_ms = 1500
+
+        last_signature = ""
+        while True:
+            with Session(engine) as session:
+                feed = _build_staff_activity_feed(session, limit=limit)
+            signature = "|".join(f"{it.get('kind')}:{it.get('ts')}:{it.get('summary')}" for it in feed)
+            if signature != last_signature:
+                last_signature = signature
+                await websocket.send_json({"type": "staff_activity_feed", "count": len(feed), "items": feed})
             await asyncio.sleep(interval_ms / 1000.0)
     except WebSocketDisconnect:
         return
