@@ -200,6 +200,9 @@ def test_staff_today_board_returns_active_items() -> None:
     body = board_resp.json()
     assert body["total_active_bookings"] >= 1
     assert len(body["items"]) >= 1
+    assert "alerts_summary" in body
+    assert "open_count" in body["alerts_summary"]
+    assert "critical_open_count" in body["alerts_summary"]
     matched = [row for row in body["items"] if row["booking_id"] == booking_id]
     assert matched
     assert matched[0]["next_action"] == "potty_check"

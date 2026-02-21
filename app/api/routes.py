@@ -762,11 +762,45 @@ def get_staff_today_board(
             }
         )
 
+    now_minus_24h = now - timedelta(hours=24)
+    open_alert_count = session.exec(
+        select(StaffAlert).where(StaffAlert.status == "open")
+    ).all()
+    critical_open_alert_count = session.exec(
+        select(StaffAlert).where(StaffAlert.status == "open").where(StaffAlert.severity == "critical")
+    ).all()
+    acked_24h = list(
+        session.exec(
+            select(StaffAlert)
+            .where(StaffAlert.acked_at.is_not(None))
+            .where(StaffAlert.acked_at >= now_minus_24h)
+        )
+    )
+    resolved_24h_count = len(
+        session.exec(
+            select(StaffAlert)
+            .where(StaffAlert.status == "resolved")
+            .where(StaffAlert.updated_at >= now_minus_24h)
+        ).all()
+    )
+    ack_durations: list[float] = []
+    for row in acked_24h:
+        if row.acked_at:
+            ack_durations.append((_to_utc(row.acked_at) - _to_utc(row.at)).total_seconds())
+    avg_ack_seconds_24h = round(sum(ack_durations) / len(ack_durations), 2) if ack_durations else None
+
     return {
         "at": now,
         "total_active_bookings": len(items),
         "zone_counts": zone_counts,
         "action_counts": action_counts,
+        "alerts_summary": {
+            "open_count": len(open_alert_count),
+            "critical_open_count": len(critical_open_alert_count),
+            "acked_24h_count": len(acked_24h),
+            "resolved_24h_count": resolved_24h_count,
+            "avg_ack_seconds_24h": avg_ack_seconds_24h,
+        },
         "items": items,
     }
 
